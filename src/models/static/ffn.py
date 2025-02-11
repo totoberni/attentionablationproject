@@ -1,8 +1,8 @@
-import torch
-import torch.nn as nn
-from typing import List, Optional
+import tensorflow as tf
+from tensorflow.keras import layers
+from typing import List, Optional, Dict, Any
 
-class DeepFFNetwork(nn.Module):
+class DeepFFNetwork(tf.keras.Model):
     def __init__(
         self,
         input_dim: int,
@@ -16,43 +16,55 @@ class DeepFFNetwork(nn.Module):
         self.hidden_dims = hidden_dims
         
         # Build layers
-        layers = []
+        self.layers_list = []
         prev_dim = input_dim
         
         for hidden_dim in hidden_dims:
             if layer_norm:
-                layers.append(nn.LayerNorm(prev_dim))
+                self.layers_list.append(layers.LayerNormalization(epsilon=1e-6))
             
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
+            self.layers_list.extend([
+                layers.Dense(hidden_dim),
                 self._get_activation(activation),
-                nn.Dropout(dropout_rate)
+                layers.Dropout(dropout_rate)
             ])
             prev_dim = hidden_dim
         
-        self.layers = nn.Sequential(*layers)
-        
         # Output projection if needed
-        self.output_proj = None
         if hidden_dims[-1] != input_dim:
-            self.output_proj = nn.Linear(hidden_dims[-1], input_dim)
+            self.output_proj = layers.Dense(input_dim)
+        else:
+            self.output_proj = None
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.layers(x)
+    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
+        for layer in self.layers_list:
+            if isinstance(layer, layers.Dropout):
+                x = layer(x, training=training)
+            else:
+                x = layer(x)
+        
         if self.output_proj is not None:
-            hidden_states = self.output_proj(hidden_states)
-        return hidden_states
+            x = self.output_proj(x)
+        return x
     
     @staticmethod
-    def _get_activation(activation: str) -> nn.Module:
+    def _get_activation(activation: str) -> layers.Layer:
         if activation.lower() == "gelu":
-            return nn.GELU()
+            return layers.Activation(tf.nn.gelu)
         elif activation.lower() == "relu":
-            return nn.ReLU()
+            return layers.ReLU()
         elif activation.lower() == "tanh":
-            return nn.Tanh()
+            return layers.Activation("tanh")
         else:
             raise ValueError(f"Unsupported activation: {activation}")
+    
+    def get_config(self) -> Dict[str, Any]:
+        config = super().get_config()
+        config.update({
+            "input_dim": self.input_dim,
+            "hidden_dims": self.hidden_dims
+        })
+        return config
 
 class ResidualFFNetwork(DeepFFNetwork):
     def __init__(
@@ -65,11 +77,11 @@ class ResidualFFNetwork(DeepFFNetwork):
     ):
         super().__init__(input_dim, hidden_dims, dropout_rate, activation, layer_norm)
         assert hidden_dims[-1] == input_dim, "Output dimension must match input for residual connection"
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + super().forward(x)
+    
+    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
+        return x + super().call(x, training=training)
 
-class PositionwiseFFN(nn.Module):
+class PositionwiseFFN(layers.Layer):
     def __init__(
         self,
         d_model: int,
@@ -81,17 +93,25 @@ class PositionwiseFFN(nn.Module):
         self.d_model = d_model
         self.d_ff = d_ff
         
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU() if activation.lower() == "gelu" else nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout_rate)
-        )
+        self.layer_norm = layers.LayerNormalization(epsilon=1e-6)
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(d_ff),
+            layers.Activation(tf.nn.gelu) if activation.lower() == "gelu" else layers.ReLU(),
+            layers.Dropout(dropout_rate),
+            layers.Dense(d_model),
+            layers.Dropout(dropout_rate)
+        ])
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
         residual = x
         x = self.layer_norm(x)
-        x = self.ffn(x)
-        return residual + x 
+        x = self.ffn(x, training=training)
+        return residual + x
+    
+    def get_config(self) -> Dict[str, Any]:
+        config = super().get_config()
+        config.update({
+            "d_model": self.d_model,
+            "d_ff": self.d_ff
+        })
+        return config 
