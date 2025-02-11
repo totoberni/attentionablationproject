@@ -1,0 +1,24 @@
+datasets:
+  emotion:
+    name: "dar-ai/emotion"
+    max_length: 128
+    vocab_size: 32000
+    text_column: "text"
+    label_column: "label"
+    
+  gutenberg:
+    name: "gutemberg2"
+    max_length: 512
+    vocab_size: 32000
+    text_column: "chosen"
+    summary_column: "summary"
+
+tokenizer:
+  type: "sentencepiece"
+  model_type: "bpe"
+  special_tokens:
+    pad: "[PAD]"
+    unk: "[UNK]"
+    cls: "[CLS]"
+    sep: "[SEP]"
+    mask: "[MASK]" 

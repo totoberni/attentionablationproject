@@ -1,0 +1,41 @@
+models:
+  transformer:
+    d_model: 768
+    num_layers: 12
+    num_heads: 8
+    dropout_rate: 0.1
+    ffn_dim: 3072
+    ablation:
+      num_ffn_heads: 4
+      ffn_activation: "gelu"
+  
+  static:
+    embedding_dim: 300
+    hidden_dims: [768, 768, 768, 768, 768, 768, 768, 768, 768, 768, 768, 768]  # 12 layers
+    dropout_rate: 0.1
+    activation: "gelu"
+    embeddings:
+      type: ["glove", "word2vec"]
+      path: "path/to/embeddings"
+
+tasks:
+  emotion:
+    - mlm
+    - classification
+    - contrastive
+    - pos_tag
+    - ner
+  
+  gutenberg:
+    - lmlm
+    - nsp
+    - discourse
+    - pos_tag
+    - ner
+
+training:
+  batch_size: 32
+  learning_rate: 2e-5
+  warmup_steps: 1000
+  max_epochs: 40
+  early_stopping_patience: 3 

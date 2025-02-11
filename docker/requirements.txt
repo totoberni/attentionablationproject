@@ -1,0 +1,11 @@
+torch>=1.9.0
+transformers>=4.5.0
+datasets>=1.6.2
+sentencepiece>=0.1.96
+numpy>=1.19.5
+pandas>=1.2.4
+PyYAML>=5.4.1
+scikit-learn>=0.24.2
+wandb>=0.12.0
+tensorflow>=2.4.0
+tensorflow-text>=2.4.0 

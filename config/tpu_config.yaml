@@ -1,0 +1,18 @@
+tpu:
+  zone: "us-central1-a"
+  type: "v3-8"
+  name: "thesis-tpu"
+  pytorch_xla: true
+  
+storage:
+  bucket: "gs://thesis-project"
+  checkpoint_dir: "checkpoints"
+  
+distribution:
+  strategy: "tpu"
+  num_replicas: 8
+  
+logging:
+  tensorboard: true
+  wandb: true
+  log_frequency: 100 
