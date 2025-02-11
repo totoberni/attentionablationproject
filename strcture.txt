@@ -1,0 +1,45 @@
+project_root/
+├── config/
+│   ├── model_config.yaml           # Model architecture parameters
+│   ├── data_config.yaml           # Dataset and preprocessing settings
+│   └── tpu_config.yaml            # TPU-specific configurations
+├── docker/
+│   ├── Dockerfile                 # TPU-compatible environment
+│   ├── requirements.txt           # Python dependencies
+│   └── scripts/
+│       └── setup_tpu.sh           # TPU initialization
+├── src/
+│   ├── data/
+│   │   ├── datasets/
+│   │   │   ├── emotion_dataset.py    # Emotion dataset handler
+│   │   │   └── gutenberg_dataset.py  # Gutenberg dataset handler
+│   │   ├── preprocessing/
+│   │   │   ├── tokenizer.py          # SentencePiece implementation
+│   │   │   └── transforms.py         # Data augmentation utilities
+│   │   └── loaders/
+│   │       └── tpu_loader.py         # TPU-optimized data loading
+│   ├── models/
+│   │   ├── transformer/
+│   │   │   ├── ablated.py           # Ablated transformer with FPN
+│   │   │   └── attention.py         # Custom attention mechanisms
+│   │   ├── static/
+│   │   │   ├── ffn.py              # Deep feed-forward network
+│   │   │   └── embeddings.py       # GloVe/Word2Vec integration
+│   │   └── probing/
+│   │       ├── structural.py        # Structural probing models
+│   │       └── information.py       # Information flow analysis
+│   ├── training/
+│   │   ├── trainer.py              # Main training loop
+│   │   ├── losses.py               # Task-specific losses
+│   │   └── metrics.py              # Evaluation metrics
+│   └── utils/
+│       ├── logging.py              # Logging utilities
+│       └── visualization.py        # Visualization tools
+├── scripts/
+│   ├── train.py                    # Training script
+│   ├── evaluate.py                 # Evaluation script
+│   └── probe.py                    # Probing analysis
+├── tests/                          # Unit tests
+├── notebooks/                      # Development notebooks
+├── logs/                          # Training logs
+└── README.md                      # Project documentation
