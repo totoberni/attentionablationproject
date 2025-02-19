@@ -1,40 +1,37 @@
 project_root/
 ├── config/
-│   ├── model_config.yaml           # Model architecture parameters
-│   ├── data_config.yaml           # Dataset and preprocessing settings
-│   └── tpu_config.yaml            # TPU-specific configurations
+│ ├── model_config.yaml # Model architecture parameters
+│ ├── data_config.yaml # Dataset and preprocessing settings
+│ └── tpu_config.yaml # TPU-specific configurations
 ├── docker/
-│   ├── Dockerfile                 # TPU-compatible environment
-│   ├── requirements.txt           # Python dependencies
-│   └── scripts/
-│       └── setup_tpu.sh           # TPU initialization
-├── src/
-│   ├── data/
-│   │   ├── DataSetup.py
-│   │   ├── Targets.py
-│   │   └── Inputs.py
-│   ├── models/
-│   │   ├── transformer/
-│   │   │   ├── ablated.py           # Ablated transformer with FPN
-│   │   │   └── attention.py         # Custom attention mechanisms
-│   │   ├── static/
-│   │   │   ├── ffn.py              # Deep feed-forward network
-│   │   │   └── embeddings.py       # GloVe/Word2Vec integration
-│   │   └── probing/
-│   │       ├── structural.py        # Structural probing models
-│   │       └── information.py       # Information flow analysis
-│   ├── training/
-│   │   ├── trainer.py              # Main training loop
-│   │   ├── losses.py               # Task-specific losses
-│   │   └── metrics.py              # Evaluation metrics
-│   └── utils/
-│       ├── logging.py              # Logging utilities
-│       └── visualization.py        # Visualization tools
-├── scripts/
-│   ├── train.py                    # Training script
-│   ├── evaluate.py                 # Evaluation script
-│   └── probe.py                    # Probing analysis
-├── tests/                          # Unit tests
-├── notebooks/                      # Development notebooks
-├── logs/                          # Training logs
-└── README.md                      # Project documentation
+│ ├── Dockerfile # TPU-compatible environment
+│ ├── requirements.txt # Python dependencies
+│ └── scripts/
+│ └── setup_tpu.sh # TPU initialization
+└── src/
+├── data/
+│ ├── core/
+│ │ ├── __init__.py
+│ │ ├── base.py
+│ │ ├── dependencies.py
+│ │ ├── models.py
+│ │ ├── setup.py
+│ │ └── types.py
+│ ├── preprocessing/
+│ │ ├── Inputs.py
+│ │ └── Targets.py
+│ └── DataPipeline.py
+├── models/
+│ ├── transformer/
+│ │ ├── ablated.py
+│ │ └── attention.py
+│ └── static/
+│ ├── ffn.py
+│ └── embeddings.py
+├── training/
+│ ├── trainer.py
+│ ├── losses.py
+│ └── metrics.py
+└── utils/
+├── logging.py
+└── visualization.py

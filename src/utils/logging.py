@@ -6,7 +6,7 @@ import json
 import yaml
 from datetime import datetime
 import wandb
-from torch.utils.tensorboard import SummaryWriter
+import tensorflow as tf
 
 class Logger:
     def __init__(
@@ -30,7 +30,7 @@ class Logger:
         
         # Initialize trackers
         if use_tensorboard:
-            self.writer = SummaryWriter(log_dir=self.log_dir)
+            self.writer = tf.summary.create_file_writer(self.log_dir)
         
         if use_wandb:
             wandb.init(
@@ -84,7 +84,7 @@ class Logger:
         # Log to tensorboard
         if self.use_tensorboard:
             for name, value in metrics.items():
-                self.writer.add_scalar(name, value, step)
+                tf.summary.scalar(name, value, step=step)
         
         # Log to wandb
         if self.use_wandb:
@@ -99,7 +99,8 @@ class Logger:
         
         # Log to tensorboard
         if self.use_tensorboard:
-            self.writer.add_hparams(params, {})
+            for name, value in params.items():
+                tf.summary.scalar(name, value)
         
         # Log to wandb
         if self.use_wandb:

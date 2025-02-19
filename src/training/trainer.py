@@ -1,26 +1,23 @@
-import torch
-import torch.nn as nn
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-from torch.utils.data import DataLoader
+import tensorflow as tf
 from typing import Dict, List, Optional, Union, Callable
 import wandb
 from tqdm import tqdm
 import os
 import logging
 from ..data.loaders.tpu_loader import TPUDataLoader
+import json
 
 class Trainer:
     def __init__(
         self,
-        model: nn.Module,
+        model: tf.keras.Model,
         train_loader: TPUDataLoader,
         val_loader: Optional[TPUDataLoader] = None,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        optimizer: Optional[tf.keras.optimizers.Optimizer] = None,
+        scheduler: Optional[tf.keras.optimizers.schedules.LearningRateSchedule] = None,
         criterion: Optional[Callable] = None,
         num_epochs: int = 40,
-        device: Optional[torch.device] = None,
+        device: Optional[str] = None,
         checkpoint_dir: str = "checkpoints",
         log_interval: int = 100,
         use_wandb: bool = True,
@@ -29,11 +26,11 @@ class Trainer:
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=2e-5)
+        self.optimizer = optimizer or tf.keras.optimizers.Adam(learning_rate=2e-5)
         self.scheduler = scheduler
-        self.criterion = criterion or nn.CrossEntropyLoss()
+        self.criterion = criterion or tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
         self.num_epochs = num_epochs
-        self.device = device or xm.xla_device()
+        self.device = device or '/TPU:0'
         self.checkpoint_dir = checkpoint_dir
         self.log_interval = log_interval
         self.use_wandb = use_wandb
@@ -42,43 +39,15 @@ class Trainer:
         # Initialize logging
         self._setup_logging()
         
-        # Move model to device
-        self.model = self.model.to(self.device)
-    
-    def train(self):
-        """Main training loop."""
-        best_val_loss = float('inf')
-        patience_counter = 0
+        # Set up TPU strategy
+        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(resolver)
+        tf.tpu.experimental.initialize_tpu_system(resolver)
+        self.strategy = tf.distribute.TPUStrategy(resolver)
         
-        for epoch in range(self.num_epochs):
-            self.logger.info(f"Starting epoch {epoch+1}/{self.num_epochs}")
-            
-            # Training phase
-            train_metrics = self._train_epoch(epoch)
-            self._log_metrics(train_metrics, "train", epoch)
-            
-            # Validation phase
-            if self.val_loader is not None:
-                val_metrics = self._validate_epoch(epoch)
-                self._log_metrics(val_metrics, "val", epoch)
-                
-                # Early stopping check
-                if val_metrics['loss'] < best_val_loss:
-                    best_val_loss = val_metrics['loss']
-                    patience_counter = 0
-                    self._save_checkpoint(epoch, val_metrics['loss'], is_best=True)
-                else:
-                    patience_counter += 1
-                    if patience_counter >= self.early_stopping_patience:
-                        self.logger.info("Early stopping triggered")
-                        break
-            
-            # Save regular checkpoint
-            self._save_checkpoint(epoch, train_metrics['loss'])
-            
-            # Update learning rate
-            if self.scheduler is not None:
-                self.scheduler.step()
+        # Move model to TPU strategy scope
+        with self.strategy.scope():
+            self.model = model
     
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
@@ -88,25 +57,22 @@ class Trainer:
         
         with tqdm(total=num_batches, desc=f"Epoch {epoch+1}") as pbar:
             for batch_idx, batch in enumerate(self.train_loader):
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                # Training step
+                with tf.GradientTape() as tape:
+                    outputs = self.model(batch, training=True)
+                    loss = self.criterion(batch['labels'], outputs)
                 
-                # Forward pass
-                self.optimizer.zero_grad()
-                outputs = self.model(**batch)
-                loss = self.criterion(outputs, batch['labels'])
-                
-                # Backward pass
-                loss.backward()
-                xm.optimizer_step(self.optimizer)
+                # Compute gradients and apply
+                gradients = tape.gradient(loss, self.model.trainable_variables)
+                self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
                 
                 # Update metrics
-                total_loss += loss.item()
+                total_loss += loss.numpy()
                 
                 # Update progress bar
                 pbar.update(1)
                 if batch_idx % self.log_interval == 0:
-                    pbar.set_postfix({'loss': loss.item()})
+                    pbar.set_postfix({'loss': float(loss.numpy())})
         
         return {'loss': total_loss / num_batches}
     
@@ -116,68 +82,87 @@ class Trainer:
         total_loss = 0
         num_batches = len(self.val_loader)
         
-        with torch.no_grad():
-            for batch in self.val_loader:
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                
-                # Forward pass
-                outputs = self.model(**batch)
-                loss = self.criterion(outputs, batch['labels'])
-                
-                # Update metrics
-                total_loss += loss.item()
+        for batch in self.val_loader:
+            outputs = self.model(batch, training=False)
+            loss = self.criterion(batch['labels'], outputs)
+            total_loss += loss.numpy()
         
         return {'loss': total_loss / num_batches}
     
-    def _save_checkpoint(self, epoch: int, loss: float, is_best: bool = False):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'loss': loss
-        }
+    def train(self) -> Dict[str, float]:
+        """Train the model for the specified number of epochs."""
+        best_val_loss = float('inf')
+        patience_counter = 0
         
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        for epoch in range(self.num_epochs):
+            # Train epoch
+            train_metrics = self._train_epoch(epoch)
+            
+            # Validate epoch
+            if self.val_loader is not None:
+                val_metrics = self._validate_epoch(epoch)
+                current_val_loss = val_metrics['loss']
+                
+                # Early stopping check
+                if current_val_loss < best_val_loss:
+                    best_val_loss = current_val_loss
+                    patience_counter = 0
+                    self._save_checkpoint(epoch, val_metrics)
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.early_stopping_patience:
+                        self.logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                        break
+            
+            # Log metrics
+            self._log_metrics(epoch, train_metrics, val_metrics if self.val_loader else None)
         
-        # Save checkpoint
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
-        xm.save(checkpoint, checkpoint_path)
-        
-        # Save best model
-        if is_best:
-            best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
-            xm.save(checkpoint, best_path)
+        return {'best_val_loss': best_val_loss}
     
-    def _log_metrics(self, metrics: Dict[str, float], phase: str, epoch: int):
-        """Log metrics to console and wandb."""
-        # Console logging
-        metrics_str = ' '.join([f'{k}: {v:.4f}' for k, v in metrics.items()])
-        self.logger.info(f"Epoch {epoch+1} {phase} metrics: {metrics_str}")
+    def _save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
+        """Save model checkpoint."""
+        checkpoint_path = os.path.join(
+            self.checkpoint_dir,
+            f"checkpoint_epoch_{epoch}.h5"
+        )
+        self.model.save_weights(checkpoint_path)
         
-        # Wandb logging
-        if self.use_wandb:
-            wandb.log({f"{phase}/{k}": v for k, v in metrics.items()}, step=epoch)
+        # Save metrics
+        metrics_path = os.path.join(
+            self.checkpoint_dir,
+            f"metrics_epoch_{epoch}.json"
+        )
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f)
     
     def _setup_logging(self):
-        """Setup logging configuration."""
-        self.logger = logging.getLogger('Trainer')
+        """Setup logging."""
+        self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         
         if not self.logger.handlers:
-            # Console handler
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            console_handler.setFormatter(formatter)
-            self.logger.addHandler(console_handler)
-            
-            # File handler
-            os.makedirs('logs', exist_ok=True)
-            file_handler = logging.FileHandler('logs/training.log')
-            file_handler.setLevel(logging.INFO)
-            file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler) 
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+    
+    def _log_metrics(
+        self,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Optional[Dict[str, float]] = None
+    ):
+        """Log metrics to wandb and console."""
+        metrics = {f"train_{k}": v for k, v in train_metrics.items()}
+        if val_metrics:
+            metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
+        
+        if self.use_wandb:
+            wandb.log(metrics, step=epoch)
+        
+        # Log to console
+        metrics_str = " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+        self.logger.info(f"Epoch {epoch + 1}/{self.num_epochs} - {metrics_str}") 

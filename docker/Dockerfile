@@ -1,5 +1,5 @@
 # Base Dockerfile for TPU VM
-FROM gcr.io/tpu-pytorch/xla:nightly
+FROM tensorflow/tensorflow:2.14.0
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Install additional TPU-specific packages
 RUN pip install cloud-tpu-client==0.10 \
-    torch_xla[tpu]==1.0 \
+    tensorflow-estimator \
     tensorboard
 
 # Set up working directory

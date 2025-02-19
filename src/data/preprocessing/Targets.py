@@ -13,6 +13,7 @@ import logging
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 from src.data.core import (
     ConfigurationManager,
@@ -186,58 +187,115 @@ class TargetGenerator:
             padding='max_length',
             truncation=True,
             max_length=max_length,
-            return_tensors='np'
+            return_tensors='np',
+            return_word_ids=True  # Added to get word_ids for alignment
         )
         
         input_shape = encoded['input_ids'].shape
         attention_mask = encoded['attention_mask']
         
-        if is_lmlm:
-            min_span = task_config.get('min_span', 2)
-            max_span = task_config.get('max_span', 5)
-            min_masks = task_config.get('min_masks', 1)
-            max_masks = task_config.get('max_masks', 5)
-            
-            # Generate span masks respecting attention mask
-            masks = np.zeros(input_shape, dtype=bool)
-            for i in range(input_shape[0]):
-                valid_length = attention_mask[i].sum()
-                num_masks = np.random.randint(min_masks, max_masks + 1)
-                
-                for _ in range(num_masks):
-                    span_length = np.random.randint(min_span, min(max_span + 1, valid_length))
-                    start = np.random.randint(0, valid_length - span_length)
-                    masks[i, start:start+span_length] = True
-        else:
-            # Standard MLM with attention mask
-            mask_prob = task_config['mask_probability']
-            masks = np.random.random(input_shape) < mask_prob
-            masks = masks & (attention_mask == 1)  # Only mask actual tokens
-            
-            if task_config.get('whole_word_mask', False) and model_type == "transformer":
-                # Use tokenizer's word IDs for whole word masking (transformer only)
-                word_ids = [tokenizer.get_word_ids(ids) for ids in encoded['input_ids']]
-                for i, word_id_seq in enumerate(word_ids):
-                    masked_words = set()
-                    for j, word_id in enumerate(word_id_seq):
-                        if word_id is not None:
-                            if word_id in masked_words:
-                                masks[i, j] = True
-                            elif masks[i, j]:
-                                masked_words.add(word_id)
+        # Generate masks based on task type
+        masks = self._generate_task_specific_masks(
+            encoded,
+            is_lmlm,
+            task_config,
+            model_type,
+            attention_mask
+        )
         
-        # Store tokenization info for potential alignment checks
+        # Enhanced metadata for alignment
         metadata = {
-            'mask_type': 'lmlm' if is_lmlm else 'mlm',
-            'model_type': model_type,
-            'tokenizer_name': tokenizer_config['model'],
-            'tokenizer_type': tokenizer_config['type'],
-            'max_length': max_length,
-            'attention_mask': attention_mask,
-            'whole_word_mask': task_config.get('whole_word_mask', False) and model_type == "transformer"
+            'tokenization_info': {
+                'model_type': model_type,
+                'tokenizer_name': tokenizer_config['model'],
+                'tokenizer_type': tokenizer_config['type'],
+                'sequence_lengths': [len(t) for t in texts],
+                'token_maps': encoded.word_ids() if hasattr(encoded, 'word_ids') else None,
+                'original_text_hashes': [self._hash_text(t) for t in texts],
+                'max_length': max_length,
+                'attention_mask': attention_mask,
+                'whole_word_mask': task_config.get('whole_word_mask', False) and model_type == "transformer",
+                'special_tokens': {
+                    'cls': tokenizer.cls_token_id,
+                    'sep': tokenizer.sep_token_id,
+                    'pad': tokenizer.pad_token_id,
+                    'mask': tokenizer.mask_token_id
+                }
+            },
+            'task_info': {
+                'type': 'lmlm' if is_lmlm else 'mlm',
+                'config': task_config
+            }
         }
         
         return encoded['input_ids'], masks, metadata
+    
+    def _hash_text(self, text: str) -> str:
+        """Generate a hash of the text for alignment verification."""
+        return hashlib.sha256(text.encode()).hexdigest()
+    
+    def verify_alignment(self, input_metadata: Dict, target_metadata: Dict) -> bool:
+        """Verify alignment between input and target processing."""
+        # Check text hashes match
+        input_hashes = input_metadata['original_text_hashes']
+        target_hashes = target_metadata['tokenization_info']['original_text_hashes']
+        
+        if input_hashes != target_hashes:
+            logger.error("Text hash mismatch between input and target processing")
+            return False
+        
+        # Check sequence lengths match
+        input_lengths = input_metadata['sequence_lengths']
+        target_lengths = target_metadata['tokenization_info']['sequence_lengths']
+        
+        if input_lengths != target_lengths:
+            logger.error("Sequence length mismatch between input and target processing")
+            return False
+        
+        # Check token mappings if available
+        input_maps = input_metadata.get('token_maps')
+        target_maps = target_metadata['tokenization_info'].get('token_maps')
+        
+        if input_maps and target_maps:
+            if not all(len(im) == len(tm) for im, tm in zip(input_maps, target_maps)):
+                logger.error("Token mapping length mismatch between input and target processing")
+                return False
+            
+            # Check special token alignment
+            input_special_tokens = input_metadata['tokenizer_info']['special_tokens']
+            target_special_tokens = target_metadata['tokenization_info']['special_tokens']
+            
+            if input_special_tokens != target_special_tokens:
+                logger.error("Special token mismatch between input and target processing")
+                return False
+        
+        return True
+    
+    def reconstruct_text(self, target_ids: np.ndarray, metadata: Dict) -> List[str]:
+        """Reconstruct original text from target IDs using metadata."""
+        tokenizer_info = metadata['tokenization_info']
+        tokenizer = self.model_manager.get_tokenizer(
+            tokenizer_info['tokenizer_type'],
+            tokenizer_info['tokenizer_name']
+        )
+        
+        # Remove special tokens and padding
+        special_tokens = tokenizer_info['special_tokens']
+        special_token_ids = set(special_tokens.values())
+        
+        reconstructed_texts = []
+        for seq_ids, mask in zip(target_ids, metadata['tokenization_info']['attention_mask']):
+            # Filter out special tokens and padding
+            valid_ids = [
+                id_ for id_, is_valid in zip(seq_ids, mask)
+                if id_ not in special_token_ids and is_valid
+            ]
+            
+            # Decode tokens
+            text = tokenizer.decode(valid_ids, skip_special_tokens=True)
+            reconstructed_texts.append(text)
+        
+        return reconstructed_texts
     
     def _generate_contrastive_targets(
         self,
@@ -517,7 +575,7 @@ class TargetHandler:
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """Generate masked language modeling targets using tokenization."""
         # Get tokenizer based on model type
-        tokenizer_config = self.config['tokenizers'][model_type]
+        tokenizer_config = self.data_config['tokenizers'][model_type]
         tokenizer = self.model_manager.get_tokenizer(
             tokenizer_config['type'],
             tokenizer_config['model']
@@ -530,55 +588,45 @@ class TargetHandler:
             padding='max_length',
             truncation=True,
             max_length=max_length,
-            return_tensors='np'
+            return_tensors='np',
+            return_word_ids=True  # Added to get word_ids for alignment
         )
         
         input_shape = encoded['input_ids'].shape
         attention_mask = encoded['attention_mask']
         
-        if is_lmlm:
-            min_span = task_config.get('min_span', 2)
-            max_span = task_config.get('max_span', 5)
-            min_masks = task_config.get('min_masks', 1)
-            max_masks = task_config.get('max_masks', 5)
-            
-            # Generate span masks respecting attention mask
-            masks = np.zeros(input_shape, dtype=bool)
-            for i in range(input_shape[0]):
-                valid_length = attention_mask[i].sum()
-                num_masks = np.random.randint(min_masks, max_masks + 1)
-                
-                for _ in range(num_masks):
-                    span_length = np.random.randint(min_span, min(max_span + 1, valid_length))
-                    start = np.random.randint(0, valid_length - span_length)
-                    masks[i, start:start+span_length] = True
-        else:
-            # Standard MLM with attention mask
-            mask_prob = task_config['mask_probability']
-            masks = np.random.random(input_shape) < mask_prob
-            masks = masks & (attention_mask == 1)  # Only mask actual tokens
-            
-            if task_config.get('whole_word_mask', False) and model_type == "transformer":
-                # Use tokenizer's word IDs for whole word masking (transformer only)
-                word_ids = [tokenizer.get_word_ids(ids) for ids in encoded['input_ids']]
-                for i, word_id_seq in enumerate(word_ids):
-                    masked_words = set()
-                    for j, word_id in enumerate(word_id_seq):
-                        if word_id is not None:
-                            if word_id in masked_words:
-                                masks[i, j] = True
-                            elif masks[i, j]:
-                                masked_words.add(word_id)
+        # Generate masks based on task type
+        masks = self._generate_task_specific_masks(
+            encoded,
+            is_lmlm,
+            task_config,
+            model_type,
+            attention_mask
+        )
         
-        # Store tokenization info for potential alignment checks
+        # Enhanced metadata for alignment
         metadata = {
-            'mask_type': 'lmlm' if is_lmlm else 'mlm',
-            'model_type': model_type,
-            'tokenizer_name': tokenizer_config['model'],
-            'tokenizer_type': tokenizer_config['type'],
-            'max_length': max_length,
-            'attention_mask': attention_mask,
-            'whole_word_mask': task_config.get('whole_word_mask', False) and model_type == "transformer"
+            'tokenization_info': {
+                'model_type': model_type,
+                'tokenizer_name': tokenizer_config['model'],
+                'tokenizer_type': tokenizer_config['type'],
+                'sequence_lengths': [len(t) for t in texts],
+                'token_maps': encoded.word_ids() if hasattr(encoded, 'word_ids') else None,
+                'original_text_hashes': [self._hash_text(t) for t in texts],
+                'max_length': max_length,
+                'attention_mask': attention_mask,
+                'whole_word_mask': task_config.get('whole_word_mask', False) and model_type == "transformer",
+                'special_tokens': {
+                    'cls': tokenizer.cls_token_id,
+                    'sep': tokenizer.sep_token_id,
+                    'pad': tokenizer.pad_token_id,
+                    'mask': tokenizer.mask_token_id
+                }
+            },
+            'task_info': {
+                'type': 'lmlm' if is_lmlm else 'mlm',
+                'config': task_config
+            }
         }
         
         return encoded['input_ids'], masks, metadata

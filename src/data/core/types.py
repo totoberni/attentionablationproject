@@ -15,13 +15,21 @@ class TaskType(Enum):
     CONTRASTIVE = auto()
 
 @dataclass
+class TaskLabels:
+    """Container for task-specific labels and metadata."""
+    labels: np.ndarray
+    mask: Optional[np.ndarray] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+@dataclass
 class ModelInput:
-    """Container for model input tensors with support for both transformer and static embeddings."""
+    """Container for model input tensors with metadata support."""
     input_ids: np.ndarray
     sequence_mask: np.ndarray
-    decoder_input: Optional[np.ndarray] = None  # For structural compatibility
-    cls_token_mask: Optional[np.ndarray] = None  # For transformer models
-    sep_token_mask: Optional[np.ndarray] = None  # For transformer models
+    decoder_input: Optional[np.ndarray] = None
+    cls_token_mask: Optional[np.ndarray] = None
+    sep_token_mask: Optional[np.ndarray] = None
+    metadata: Optional[Dict[str, Any]] = None
     
     def to_tensors(self) -> Dict[str, tf.Tensor]:
         """Convert numpy arrays to TensorFlow tensors."""
@@ -42,34 +50,18 @@ class ModelInput:
             if value is not None
         })
         
+        if self.metadata:
+            tensors['input_metadata'] = self.metadata
+        
         return tensors
 
 @dataclass
-class TaskLabels:
-    """Container for task-specific labels and masks."""
-    task_type: TaskType
-    labels: np.ndarray
-    mask: Optional[np.ndarray] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-@dataclass
 class ModelTarget:
-    """Container for model target tensors with task-specific labels."""
+    """Container for model target tensors with task-specific labels and metadata."""
     reconstruction_targets: np.ndarray
     sequence_mask: np.ndarray
-    task_labels: Dict[TaskType, TaskLabels] = field(default_factory=dict)
-    metadata: Optional[Dict[str, np.ndarray]] = None
-    
-    def add_task_labels(self, task_type: TaskType, labels: np.ndarray, 
-                       mask: Optional[np.ndarray] = None,
-                       metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Add labels for a specific task."""
-        self.task_labels[task_type] = TaskLabels(
-            task_type=task_type,
-            labels=labels,
-            mask=mask,
-            metadata=metadata
-        )
+    task_labels: Dict[str, TaskLabels] = field(default_factory=dict)
+    metadata: Optional[Dict[str, Any]] = None
     
     def to_tensors(self) -> Dict[str, tf.Tensor]:
         """Convert all arrays to TensorFlow tensors."""
@@ -79,20 +71,30 @@ class ModelTarget:
         }
         
         # Convert task-specific labels
-        for task_type, task_labels in self.task_labels.items():
-            task_name = task_type.name.lower()
+        for task_name, task_labels in self.task_labels.items():
             tensors[f'{task_name}_labels'] = tf.convert_to_tensor(task_labels.labels, dtype=tf.int32)
             
             if task_labels.mask is not None:
                 tensors[f'{task_name}_mask'] = tf.convert_to_tensor(task_labels.mask, dtype=tf.int32)
             
             if task_labels.metadata:
-                for meta_key, meta_value in task_labels.metadata.items():
-                    tensors[f'{task_name}_{meta_key}'] = tf.convert_to_tensor(meta_value)
+                tensors[f'{task_name}_metadata'] = task_labels.metadata
         
-        # Add general metadata if present
         if self.metadata:
-            for key, value in self.metadata.items():
-                tensors[f'metadata_{key}'] = tf.convert_to_tensor(value)
+            tensors['target_metadata'] = self.metadata
         
-        return tensors 
+        return tensors
+    
+    def add_task_labels(
+        self,
+        task_name: str,
+        labels: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ):
+        """Add task-specific labels with metadata."""
+        self.task_labels[task_name] = TaskLabels(
+            labels=labels,
+            mask=mask,
+            metadata=metadata
+        ) 
