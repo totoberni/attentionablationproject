@@ -16,31 +16,18 @@ class DatasetSetup:
         self.split = split
         
         # Initialize preprocessing components
-        self.tokenizer = self._setup_tokenizer()
         self.text_cleaner = self._setup_text_cleaner()
-    
-    def _setup_tokenizer(self) -> Union[AutoTokenizer, Any]:
-        """Setup tokenizer based on configuration."""
-        tokenizer_config = self.config.get(
-            "transformer_tokenizer" if "transformer" in self.dataset_config["tasks"]
-            else "static_tokenizer"
-        )
-        
-        if tokenizer_config["type"] == "wordpiece":
-            return AutoTokenizer.from_pretrained(
-                tokenizer_config["pretrained_model_name_or_path"]
-            )
-        else:
-            raise ValueError(f"Unsupported tokenizer type: {tokenizer_config['type']}")
     
     def _setup_text_cleaner(self):
         """Setup text cleaner based on configuration."""
         preprocessing_config = self.dataset_config["preprocessing"]
         
         def clean_text(text: tf.Tensor) -> tf.Tensor:
-            text = tf.strings.lower(text)
+            # Only perform text cleaning, no tokenization
             if preprocessing_config["remove_html"]:
                 text = tf.strings.regex_replace(text, '<[^>]*>', ' ')
+            if preprocessing_config["normalize_unicode"]:
+                text = tf.strings.unicode_normalize('NFKC', text)
             if preprocessing_config["handle_numbers"]:
                 text = tf.strings.regex_replace(text, r'\d+', '[NUM]')
             text = tf.strings.regex_replace(text, r'\s+', ' ')
@@ -94,24 +81,30 @@ class DatasetSetup:
         label: Optional[tf.Tensor] = None
     ) -> Dict[str, tf.Tensor]:
         """Preprocess a single example."""
-        # Clean text
+        # Only clean text, no tokenization
         text = self.text_cleaner(text)
         
-        # Tokenize
-        encoded = self.tokenizer(
-            text.numpy().decode(),
-            max_length=self.dataset_config["max_length"],
-            padding="max_length",
-            truncation=True,
-            return_tensors="tf"
-        )
-        
         features = {
-            "input_ids": encoded["input_ids"][0],
-            "attention_mask": encoded["attention_mask"][0]
+            "text": text
         }
         
         if label is not None:
             features["labels"] = label
         
-        return features 
+        return features
+
+    def preprocess_text(self, text: tf.Tensor) -> tf.Tensor:
+        """Preprocess text according to configuration."""
+        # Remove HTML if configured
+        if self.config.get('remove_html', False):
+            text = tf.strings.regex_replace(text, '<[^>]+>', '')
+        
+        # Normalize unicode if configured
+        if self.config.get('normalize_unicode', False):
+            text = tf.strings.unicode_normalize('NFKC', text)
+        
+        # Handle numbers if configured
+        if self.config.get('handle_numbers', False):
+            text = tf.strings.regex_replace(text, r'\d+', '[NUM]')
+        
+        return text 

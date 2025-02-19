@@ -1,9 +1,19 @@
-from typing import Dict, List, Optional, Union, Any
-import tensorflow as tf
+from typing import Dict, List, Optional, Union
 import numpy as np
-from ..core.setup import DatasetSetup
+import tensorflow as tf
 from datasets import Dataset
-from src.data.core import ConfigurationManager, ModelManager
+from transformers import AutoTokenizer
+import spacy
+import nltk
+from nltk.tokenize import word_tokenize
+nltk.download('punkt')
+
+from src.data.core import (
+    ConfigurationManager, 
+    ModelManager,
+    ModelInput,
+    TaskType
+)
 
 class InputProcessor:
     """Handles input processing and tokenization for model training."""
@@ -13,8 +23,12 @@ class InputProcessor:
         self.model_manager = model_manager
         self.data_config = config_manager.get_config('data')
     
-    def process_inputs(self, texts: List[str], dataset_name: str) -> Dict[str, np.ndarray]:
+    def process_inputs(self, texts: List[str], dataset_name: str) -> ModelInput:
         """Process inputs based on dataset configuration."""
+        # Ensure we're working with raw text
+        if not all(isinstance(text, str) for text in texts):
+            raise ValueError("All inputs must be raw text strings, not tokenized sequences")
+            
         dataset_config = self.data_config['datasets'][dataset_name]
         
         # Get appropriate tokenizer from model manager
@@ -22,20 +36,31 @@ class InputProcessor:
         tokenizer = self._get_tokenizer(tokenizer_config)
         
         # Process inputs according to configuration
-        processed_inputs = self._tokenize_and_process(texts, tokenizer, dataset_config)
+        encoded = tokenizer(
+            texts,
+            padding='max_length',
+            truncation=True,
+            max_length=dataset_config['max_length'],
+            return_tensors='np'
+        )
         
-        return processed_inputs
+        # Create ModelInput instance
+        return ModelInput(
+            input_ids=encoded['input_ids'],
+            sequence_mask=encoded['attention_mask'],
+            cls_token_mask=self._get_special_token_mask(encoded['input_ids'], tokenizer.cls_token_id),
+            sep_token_mask=self._get_special_token_mask(encoded['input_ids'], tokenizer.sep_token_id)
+        )
     
     def _get_tokenizer(self, config: Dict):
         """Retrieve appropriate tokenizer from model manager."""
         model_type = config['type']
         model_name = config['model']
-        return self.model_manager.get_model(model_type, model_name)[1]
+        return self.model_manager.get_tokenizer(model_type, model_name)
     
-    def _tokenize_and_process(self, texts: List[str], tokenizer, config: Dict):
-        """Implement tokenization and processing logic."""
-        # Implementation of tokenization and processing
-        return {}  # Placeholder for actual implementation
+    def _get_special_token_mask(self, input_ids: np.ndarray, token_id: int) -> np.ndarray:
+        """Create mask for special tokens."""
+        return (input_ids == token_id).astype(np.int32)
 
     def prepare_inputs(
         self,
