@@ -10,14 +10,9 @@ project_root/
 │       └── setup_tpu.sh           # TPU initialization
 ├── src/
 │   ├── data/
-│   │   ├── datasets/
-│   │   │   ├── emotion_dataset.py    # Emotion dataset handler
-│   │   │   └── gutenberg_dataset.py  # Gutenberg dataset handler
-│   │   ├── preprocessing/
-│   │   │   ├── tokenizer.py          # SentencePiece implementation
-│   │   │   └── transforms.py         # Data augmentation utilities
-│   │   └── loaders/
-│   │       └── tpu_loader.py         # TPU-optimized data loading
+│   │   ├── DataSetup.py
+│   │   ├── Targets.py
+│   │   └── Inputs.py
 │   ├── models/
 │   │   ├── transformer/
 │   │   │   ├── ablated.py           # Ablated transformer with FPN
