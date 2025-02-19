@@ -1,109 +1,148 @@
-datasets:
-  emotion:
-    name: "dair-ai/emotion"
-    max_length: 128
-    vocab_size: 32000
-    text_column: "text"
-    label_column: "label"
-    tasks:
-      mlm:
-        enabled: true
-        mask_probability: 0.15
-        max_predictions_per_seq: 20
-      classification:
-        enabled: true
-        num_labels: 6
-      contrastive:
-        enabled: true
-        temperature: 0.07
-      pos_tag:
-        enabled: true
-        use_universal_tags: true
-      ner:
-        enabled: true
-    preprocessing:
-      remove_html: true
-      normalize_whitespace: true
-      lowercase: false
-    splits:
-      train: 0.8
-      validation: 0.1
-      test: 0.1
-    
-  gutenberg:
-    name: "gutemberg2"
-    max_length: 512
-    vocab_size: 32000
-    text_column: "chosen"
-    summary_column: "summary"
-    tasks:
-      lmlm:
-        enabled: true
-        chunk_size: 256
-        stride: 128
-      ner:
-        enabled: true
-        use_bio_tags: true
-      pos_tag:
-        enabled: true
-        use_universal_tags: true
-      nsp:
-        enabled: true
-        negative_sample_rate: 0.5
-      discourse:
-        enabled: true
-        marker_types: ["causal", "temporal", "comparison", "addition", "contrast"]
-    preprocessing:
-      remove_html: true
-      normalize_whitespace: true
-      lowercase: false
-      preserve_case_for_ner: true
-    splits:
-      train: 0.8
-      validation: 0.1
-      test: 0.1
-
-tokenizer:
-  type: "sentencepiece"
-  model_type: "bpe"
-  vocab_size: 32000
-  character_coverage: 0.9995
-  max_sentence_length: 2048
-  pad_to_multiple_of: 8
+transformer_tokenizer:
+  type: "wordpiece"
+  pretrained_model_name_or_path: "bert-base-cased"
+  vocab_size: 30522
   special_tokens:
     pad: "[PAD]"
     unk: "[UNK]"
     cls: "[CLS]"
     sep: "[SEP]"
     mask: "[MASK]"
-  training:
-    input_sentence_size: 10000000
-    shuffle_input_sentence: true
-    train_extremely_large_corpus: true
 
-processing:
-  num_workers: 4
-  batch_size: 32
-  shuffle_buffer_size: 10000
-  prefetch_buffer_size: "auto"
-  max_samples_per_task: null
-  sequence_buckets:
-    enabled: true
-    boundaries: [32, 64, 128, 256, 512]
+static_tokenizer:
+  type: "spacy"
+  model: "en_core_web_sm"
+  lower_case: false
+  vocab_size: 20000
+  min_freq: 3
+  learn_special_tokens: true
+  special_tokens:
+    pad: "<pad>"
+    unk: "<unk>"
+    cls: "<cls>"
+    sep: "<sep>"
+    mask: "<mask>"
 
-output:
-  return_tensors: "tf"
-  output_dir: "processed_data"
-  save_processed: true
-  compression: "GZIP"
-  monitoring:
-    log_preprocessing_stats: true
-    save_samples: true
-    num_samples: 100
+label_generation:
+  models:
+    sentiment:
+      type: "transformer"
+      model: "distilbert-base-cased-finetuned-sst-2-english"
+      checkpoint: "dair-ai/emotion"
+    ner:
+      type: "spacy"
+      model: "en_core_web_lg"
+      align_with_tokens: true
+    pos:
+      type: "spacy"
+      model: "en_core_web_lg"
+      align_with_tokens: true
+    discourse:
+      type: "transformer"
+      model: "bert-base-cased"
+      checkpoint: "discourse-markers-en"
+      markers: ["however", "therefore", "moreover", "nevertheless", "consequently"]
+    contrastive:
+      type: "sklearn"
+      model: "silhouette"
+      clustering_method: "kmeans"
+      min_clusters: 3
+      max_clusters: 8
+      validation_metrics: ["silhouette", "calinski_harabasz"]
 
-validation:
-  validate_outputs: true
-  max_sequence_length_quantile: 0.99
-  min_sequence_length: 8
-  check_label_distribution: true
-  verify_special_tokens: true
+datasets:
+  gutenberg:
+    name: "nbeerbower/gutenberg2-dpo"
+    text_column: "chosen"
+    label_column: null
+    tasks:
+      mlm:
+        enabled: true
+        mask_probability: 0.15
+        whole_word_mask: true
+        min_tokens: 1
+        max_tokens: 20
+      lmlm:
+        enabled: true
+        mask_probability: 0.15
+        min_masks: 1
+        max_masks: 5
+        min_span: 2
+        max_span: 5
+      nsp:
+        enabled: true
+        model: "bert-base-cased"
+        negative_sampling_ratio: 0.5
+      ner:
+        enabled: true
+        model: "ner"
+        batch_size: 32
+      pos:
+        enabled: true
+        model: "pos"
+        batch_size: 32
+      discourse:
+        enabled: true
+        model: "discourse"
+        markers_from_config: true
+      contrastive:
+        enabled: true
+        validation: ["silhouette", "task_clusters"]
+        tasks_for_clustering: ["ner", "pos", "discourse"]
+        min_silhouette_score: 0.5
+    splits:
+      validation: 0.10
+      test: 0.10
+    max_length: 128
+    preprocessing:
+      remove_html: true
+      normalize_unicode: true
+      handle_numbers: true
+
+  emotion:
+    name: "dair-ai/emotion"
+    text_column: "text"
+    label_column: "label"
+    tasks:
+      mlm:
+        enabled: true
+        mask_probability: 0.15
+        whole_word_mask: true
+        min_tokens: 1
+        max_tokens: 10
+      lmlm:
+        enabled: true
+        mask_probability: 0.15
+        min_masks: 1
+        max_masks: 3
+        min_span: 2
+        max_span: 4
+      sentiment:
+        enabled: true
+        model: "sentiment"
+        preserve_original_labels: true
+      ner:
+        enabled: true
+        model: "ner"
+        batch_size: 32
+      pos:
+        enabled: true
+        model: "pos"
+        batch_size: 32
+      discourse:
+        enabled: true
+        model: "discourse"
+        markers_from_config: true
+      contrastive:
+        enabled: true
+        validation: ["silhouette", "task_clusters"]
+        tasks_for_clustering: ["sentiment", "ner", "pos", "discourse"]
+        min_silhouette_score: 0.5
+    splits:
+      validation: 0.20
+      test: 0.10
+    max_length: 64
+    preprocessing:
+      remove_html: true
+      normalize_unicode: true
+      handle_numbers: true

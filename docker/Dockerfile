@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     software-properties-common
 
-# Install Python packages
-COPY requirements.txt /tmp/
+# Copy requirements and install Python packages
+COPY docker/requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Install additional TPU-specific packages
