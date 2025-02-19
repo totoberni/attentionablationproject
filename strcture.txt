@@ -35,3 +35,7 @@ project_root/
 └── utils/
 ├── logging.py
 └── visualization.py
+
+
+chmod +x scripts/setup_tpu.sh scripts/set_down.sh
+icacls scripts/run_preprocess.sh /grant Users:RX

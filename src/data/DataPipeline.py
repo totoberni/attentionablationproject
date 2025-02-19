@@ -4,6 +4,7 @@ import logging
 import tensorflow as tf
 import numpy as np
 from datetime import datetime
+import os
 
 from src.data.core import (
     ConfigurationManager,
@@ -35,131 +36,55 @@ class DataPipeline:
         self.input_processor = InputProcessor(self.config_manager, self.model_manager)
         self.target_handler = TargetHandler(self.config_manager, self.model_manager)
     
-    def prepare_dataset(
+    def process_data(
         self, 
+        data_source: Union[DatasetDict, List[str]],
         dataset_name: str,
         tasks: Optional[List[TaskType]] = None,
-        model_type: str = "transformer"
-    ) -> DatasetDict:
-        """Prepare a dataset with all necessary processing steps."""
+        model_type: str = "transformer",
+        is_batch: bool = False
+    ) -> Union[DatasetDict, Dict[str, tf.Tensor]]:
+        """Process data (either dataset or batch) with unified processing logic."""
         # Initialize dependencies if needed
-        self.dependency_manager.install_dependencies()
+        if not is_batch:
+            self.dependency_manager.install_dependencies()
         
-        # Load and setup dataset
-        dataset = self.dataset_setup.initialize_dataset(dataset_name)
-        
-        # Process dataset
-        processed_dataset = self._process_dataset(dataset, dataset_name, tasks, model_type)
-        
-        return processed_dataset
+        if is_batch:
+            return self._process_single_batch(data_source, dataset_name, tasks, model_type)
+        else:
+            return self._process_dataset_splits(data_source, dataset_name, tasks, model_type)
     
-    def _process_dataset(
-        self, 
-        dataset: DatasetDict, 
+    def _process_single_batch(
+        self,
+        texts: List[str],
         dataset_name: str,
-        tasks: Optional[List[TaskType]] = None,
-        model_type: str = "transformer"
-    ) -> DatasetDict:
-        """Apply all processing steps to the dataset with bidirectional alignment validation."""
-        for split_name, split_data in dataset.items():
-            logger.info(f"Processing {split_name} split for {model_type} model...")
-            raw_texts = split_data['text']
-            
-            # Forward direction: Raw Text -> Targets -> Validate with Inputs
-            logger.info("Generating targets and validating alignment with inputs...")
-            model_targets: ModelTarget = self.target_handler.generate_targets(
-                raw_texts,
-                dataset_name,
-                tasks,
-                model_type
-            )
-            
-            model_inputs: ModelInput = self.input_processor.process_inputs(
-                raw_texts,
-                dataset_name,
-                model_type
-            )
-            
-            # Validate target-to-input alignment
-            if not self.verify_alignment(model_targets.metadata, model_inputs.metadata, "target_to_input"):
-                raise ValueError(
-                    f"Target-to-Input alignment validation failed in {split_name} split\n"
-                    f"Model type: {model_type}\n"
-                    f"Dataset: {dataset_name}"
-                )
-            
-            # Reverse direction: Raw Text -> Inputs -> Validate with Targets
-            logger.info("Validating input-to-target alignment...")
-            if not self.verify_alignment(model_inputs.metadata, model_targets.metadata, "input_to_target"):
-                raise ValueError(
-                    f"Input-to-Target alignment validation failed in {split_name} split\n"
-                    f"Model type: {model_type}\n"
-                    f"Dataset: {dataset_name}"
-                )
-            
-            # Store alignment verification metadata
-            alignment_metadata = {
-                'alignment_verified': True,
-                'timestamp': datetime.now().isoformat(),
-                'split': split_name,
-                'model_type': model_type,
-                'dataset': dataset_name,
-                'processed_tasks': list(self.input_processor.processed_inputs),
-                'alignment_validations': {
-                    'target_to_input': True,
-                    'input_to_target': True,
-                    'validation_timestamp': datetime.now().isoformat()
-                }
-            }
-            
-            # Convert to tensors and combine
-            input_tensors = model_inputs.to_tensors()
-            target_tensors = model_targets.to_tensors()
-            
-            # Update dataset with processed features
-            processed_features = {
-                **input_tensors,
-                **target_tensors,
-                'metadata': alignment_metadata
-            }
-            dataset[split_name] = split_data.add_columns(processed_features)
-            
-            logger.info(f"Successfully processed {split_name} split with bidirectional alignment validation")
-        
-        return dataset
-    
-    def process_batch(
-        self, 
-        texts: List[str], 
-        dataset_name: str,
-        tasks: Optional[List[TaskType]] = None,
-        model_type: str = "transformer"
+        tasks: Optional[List[TaskType]],
+        model_type: str
     ) -> Dict[str, tf.Tensor]:
-        """Process a single batch of texts."""
+        """Process a single batch of texts with bidirectional verification."""
         logger.info(f"Processing batch for {model_type} model...")
         
-        # Process inputs
-        model_inputs: ModelInput = self.input_processor.process_inputs(
+        # Forward direction: Text → Input → Target verification
+        model_inputs = self.input_processor.process_inputs(
             texts=texts,
             dataset_name=dataset_name,
             model_type=model_type
         )
         
-        # Generate targets
-        model_targets: ModelTarget = self.target_handler.generate_targets(
-            texts=texts, 
+        model_targets = self.target_handler.generate_targets(
+            texts=texts,
             dataset_name=dataset_name,
             tasks=tasks,
             model_type=model_type
         )
         
-        # Verify alignment
-        if not self.verify_alignment(model_inputs.metadata, model_targets.metadata):
-            raise ValueError(
-                f"Input and target processing misalignment detected in batch\n"
-                f"Model type: {model_type}\n"
-                f"Dataset: {dataset_name}"
-            )
+        # Verify bidirectional alignment
+        self._verify_bidirectional_alignment(
+            model_inputs.metadata,
+            model_targets.metadata,
+            dataset_name,
+            model_type
+        )
         
         # Store alignment verification in metadata
         alignment_metadata = {
@@ -167,65 +92,111 @@ class DataPipeline:
             'timestamp': datetime.now().isoformat(),
             'model_type': model_type,
             'dataset': dataset_name,
-            'processed_tasks': list(self.input_processor.processed_inputs)
+            'processed_tasks': list(self.input_processor.processed_inputs),
+            'verification_type': 'bidirectional'
         }
         
         # Combine tensors
-        processed_batch = {
+        return {
             **model_inputs.to_tensors(),
             **model_targets.to_tensors(),
             'metadata': alignment_metadata
         }
-        
-        logger.info(f"Successfully processed batch with {len(processed_batch)} features")
-        return processed_batch
     
-    def verify_alignment(
+    def _process_dataset_splits(
+        self,
+        dataset: DatasetDict,
+        dataset_name: str,
+        tasks: Optional[List[TaskType]],
+        model_type: str
+    ) -> DatasetDict:
+        """Process all splits in a dataset with bidirectional verification."""
+        for split_name, split_data in dataset.items():
+            logger.info(f"Processing {split_name} split for {model_type} model...")
+            raw_texts = split_data['text']
+            
+            # Process the split as a batch
+            processed_features = self._process_single_batch(
+                raw_texts,
+                dataset_name,
+                tasks,
+                model_type
+            )
+            
+            # Update dataset with processed features
+            dataset[split_name] = split_data.add_columns(processed_features)
+            
+            logger.info(f"Successfully processed {split_name} split with bidirectional verification")
+        
+        return dataset
+    
+    def _verify_bidirectional_alignment(
+        self,
+        input_metadata: Dict,
+        target_metadata: Dict,
+        dataset_name: str,
+        model_type: str
+    ) -> None:
+        """Verify bidirectional alignment between inputs and targets."""
+        logger.info("Performing bidirectional alignment verification...")
+        
+        # Input → Target verification
+        input_to_target = self._verify_alignment_direction(
+            input_metadata,
+            target_metadata,
+            "input_to_target"
+        )
+        
+        # Target → Input verification
+        target_to_input = self._verify_alignment_direction(
+            target_metadata,
+            input_metadata,
+            "target_to_input"
+        )
+        
+        if not (input_to_target and target_to_input):
+            raise ValueError(
+                f"Bidirectional alignment verification failed\n"
+                f"Model type: {model_type}\n"
+                f"Dataset: {dataset_name}\n"
+                f"Input→Target: {input_to_target}\n"
+                f"Target→Input: {target_to_input}"
+            )
+    
+    def _verify_alignment_direction(
         self,
         source_metadata: Dict,
         target_metadata: Dict,
         direction: str
     ) -> bool:
-        """Verify alignment between source and target processing with direction tracking."""
-        logger.info(f"Verifying {direction} alignment...")
-        
+        """Verify alignment in a single direction with task verification."""
         try:
-            # Verify using both processors for extra robustness
-            if direction == "target_to_input":
-                input_aligned = self.input_processor.verify_alignment(
-                    target_metadata['tokenization_info'],
-                    source_metadata
+            # Base alignment verification
+            if direction == "input_to_target":
+                aligned = self.input_processor.verify_alignment(
+                    source_metadata,
+                    target_metadata.get('tokenization_info', {})
                 )
-                target_aligned = self.target_handler.verify_alignment(
+            else:  # target_to_input
+                aligned = self.target_handler.verify_alignment(
                     source_metadata,
                     target_metadata
                 )
-            else:  # input_to_target
-                input_aligned = self.input_processor.verify_alignment(
-                    source_metadata,
-                    target_metadata['tokenization_info']
-                )
-                target_aligned = self.target_handler.verify_alignment(
-                    target_metadata,
-                    source_metadata
-                )
             
-            if not input_aligned or not target_aligned:
-                logger.error(f"{direction} alignment verification failed")
-                logger.error("Source metadata: %s", source_metadata)
-                logger.error("Target metadata: %s", target_metadata)
+            if not aligned:
+                logger.error(f"{direction} base alignment failed")
                 return False
             
-            # Additional checks for task-specific alignment
+            # Task-specific alignment verification
             if 'task_inputs' in source_metadata:
-                for task, task_inputs in source_metadata['task_inputs'].items():
+                for task, task_data in source_metadata['task_inputs'].items():
                     if task in target_metadata.get('task_info', {}):
-                        if not self._verify_task_alignment(
+                        if not self._verify_task_data(
                             task,
-                            task_inputs,
+                            task_data,
                             target_metadata['task_info'][task]
                         ):
-                            logger.error(f"Task alignment failed for {task} in {direction}")
+                            logger.error(f"{direction} task alignment failed for {task}")
                             return False
             
             logger.info(f"{direction} alignment verification successful")
@@ -235,67 +206,164 @@ class DataPipeline:
             logger.error(f"Error during {direction} alignment verification: {str(e)}")
             return False
     
-    def _verify_task_alignment(
+    def _verify_task_data(
         self,
         task: str,
-        input_task_data: Dict,
-        target_task_data: Dict
+        source_data: Dict,
+        target_data: Dict
     ) -> bool:
-        """Verify alignment for task-specific data."""
+        """Verify alignment of task-specific data."""
         try:
             if task in ["mlm", "lmlm"]:
-                # Check mask positions match
-                input_masks = input_task_data.get('masked_positions')
-                target_masks = target_task_data.get('masked_positions')
-                if input_masks is not None and target_masks is not None:
-                    if not np.array_equal(input_masks, target_masks):
-                        logger.error(f"Mask position mismatch for {task}")
-                        return False
+                return np.array_equal(
+                    source_data.get('masked_positions'),
+                    target_data.get('masked_positions')
+                )
             
             elif task == "nsp":
-                # Check pair information matches
-                input_pairs = input_task_data.get('nsp_labels')
-                target_pairs = target_task_data.get('nsp_labels')
-                if input_pairs is not None and target_pairs is not None:
-                    if not np.array_equal(input_pairs, target_pairs):
-                        logger.error("NSP label mismatch")
-                        return False
+                return np.array_equal(
+                    source_data.get('nsp_labels'),
+                    target_data.get('nsp_labels')
+                )
             
+            # Add more task-specific verifications as needed
             return True
+            
         except Exception as e:
-            logger.error(f"Error during task alignment verification: {str(e)}")
+            logger.error(f"Error during task data verification for {task}: {str(e)}")
             return False
     
-    def reconstruct_batch(
+    def reconstruct_data(
+        self,
+        processed_data: Union[Dict[str, tf.Tensor], DatasetDict],
+        reconstruction_type: str = "both"
+    ) -> Union[Dict[str, List[str]], Dict[str, Dict[str, List[str]]]]:
+        """Reconstruct original text from processed data."""
+        if isinstance(processed_data, dict):
+            return self._reconstruct_single_batch(processed_data, reconstruction_type)
+        else:
+            return {
+                split: self._reconstruct_single_batch(split_data, reconstruction_type)
+                for split, split_data in processed_data.items()
+            }
+    
+    def _reconstruct_single_batch(
         self,
         batch: Dict[str, tf.Tensor],
-        source: str = "both"
+        reconstruction_type: str
     ) -> Dict[str, List[str]]:
-        """Reconstruct original text from processed batch."""
+        """Reconstruct original text from a single processed batch."""
         result = {}
         
         try:
-            if source in ["input", "both"]:
+            if reconstruction_type in ["input", "both"]:
                 result["input_texts"] = self.input_processor.reconstruct_text(
                     batch["input_ids"].numpy(),
                     batch["input_metadata"]
                 )
             
-            if source in ["target", "both"]:
+            if reconstruction_type in ["target", "both"]:
                 result["target_texts"] = self.target_handler.reconstruct_text(
                     batch["reconstruction_targets"].numpy(),
                     batch["target_metadata"]
                 )
             
             # Verify reconstruction alignment
-            if source == "both" and len(result.get("input_texts", [])) == len(result.get("target_texts", [])):
-                for i, (input_text, target_text) in enumerate(zip(result["input_texts"], result["target_texts"])):
-                    if input_text != target_text:
-                        logger.warning(f"Reconstruction mismatch at index {i}:")
-                        logger.warning(f"Input:  {input_text}")
-                        logger.warning(f"Target: {target_text}")
+            if reconstruction_type == "both":
+                self._verify_reconstruction_alignment(
+                    result.get("input_texts", []),
+                    result.get("target_texts", [])
+                )
             
             return result
+            
         except Exception as e:
             logger.error(f"Error during batch reconstruction: {str(e)}")
             return {}
+    
+    def _verify_reconstruction_alignment(
+        self,
+        input_texts: List[str],
+        target_texts: List[str]
+    ) -> None:
+        """Verify alignment between reconstructed input and target texts."""
+        if len(input_texts) != len(target_texts):
+            logger.error("Reconstruction length mismatch")
+            return
+        
+        for i, (input_text, target_text) in enumerate(zip(input_texts, target_texts)):
+            if input_text != target_text:
+                logger.warning(f"Reconstruction mismatch at index {i}:")
+                logger.warning(f"Input:  {input_text}")
+                logger.warning(f"Target: {target_text}")
+
+    def save_to_tfrecord(self, data: Dict[str, tf.Tensor], output_path: str) -> None:
+        """Save processed data to TFRecord format on GCS."""
+        def _create_example(features: Dict[str, tf.Tensor]) -> tf.train.Example:
+            feature_dict = {}
+            
+            for key, value in features.items():
+                if isinstance(value, (int, bool)):
+                    feature = tf.train.Feature(
+                        int64_list=tf.train.Int64List(value=[value])
+                    )
+                elif isinstance(value, float):
+                    feature = tf.train.Feature(
+                        float_list=tf.train.FloatList(value=[value])
+                    )
+                elif isinstance(value, str):
+                    feature = tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[value.encode()])
+                    )
+                elif isinstance(value, (tf.Tensor, np.ndarray)):
+                    if value.dtype in [tf.int32, tf.int64, bool]:
+                        feature = tf.train.Feature(
+                            int64_list=tf.train.Int64List(value=value.flatten())
+                        )
+                    elif value.dtype in [tf.float32, tf.float64]:
+                        feature = tf.train.Feature(
+                            float_list=tf.train.FloatList(value=value.flatten())
+                        )
+                    else:
+                        feature = tf.train.Feature(
+                            bytes_list=tf.train.BytesList(value=[tf.io.serialize_tensor(value).numpy()])
+                        )
+                else:
+                    continue
+                
+                feature_dict[key] = feature
+            
+            return tf.train.Example(features=tf.train.Features(feature=feature_dict))
+        
+        # Ensure output directory exists
+        output_dir = os.path.dirname(output_path)
+        if not tf.io.gfile.exists(output_dir):
+            tf.io.gfile.makedirs(output_dir)
+        
+        # Write TFRecord file
+        with tf.io.TFRecordWriter(output_path) as writer:
+            for example in data:
+                tf_example = _create_example(example)
+                writer.write(tf_example.SerializeToString())
+        
+        logger.info(f"Saved TFRecord file to: {output_path}")
+
+    def _verify_gcs_path(self, path: str) -> bool:
+        """Verify that a GCS path exists and is accessible."""
+        try:
+            return tf.io.gfile.exists(path)
+        except:
+            return False
+
+    def _get_dataset_from_gcs(self, gcs_path: str) -> tf.data.Dataset:
+        """Load a dataset from GCS."""
+        if not self._verify_gcs_path(gcs_path):
+            raise FileNotFoundError(f"GCS path not found: {gcs_path}")
+        
+        file_pattern = os.path.join(gcs_path, "*.tfrecord")
+        filenames = tf.io.gfile.glob(file_pattern)
+        
+        if not filenames:
+            raise ValueError(f"No TFRecord files found in {gcs_path}")
+        
+        return tf.data.TFRecordDataset(filenames)
