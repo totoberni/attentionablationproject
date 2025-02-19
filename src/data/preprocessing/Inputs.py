@@ -2,22 +2,41 @@ from typing import Dict, List, Optional, Union, Any
 import tensorflow as tf
 import numpy as np
 from ..core.setup import DatasetSetup
+from datasets import Dataset
+from src.data.core import ConfigurationManager, ModelManager
 
 class InputProcessor:
-    def __init__(
-        self,
-        config_manager,
-        dataset_name: str
-    ):
-        self.config = config_manager.get_config("data_config")
-        self.dataset_config = self.config["datasets"][dataset_name]
-        self.max_length = self.dataset_config["max_length"]
-        self.preprocessing_config = self.dataset_config["preprocessing"]
-        
-        # Get tokenizer from DatasetSetup
-        self.dataset_setup = DatasetSetup(config_manager, dataset_name)
-        self.tokenizer = self.dataset_setup.tokenizer
+    """Handles input processing and tokenization for model training."""
     
+    def __init__(self, config_manager: ConfigurationManager, model_manager: ModelManager):
+        self.config_manager = config_manager
+        self.model_manager = model_manager
+        self.data_config = config_manager.get_config('data')
+    
+    def process_inputs(self, texts: List[str], dataset_name: str) -> Dict[str, np.ndarray]:
+        """Process inputs based on dataset configuration."""
+        dataset_config = self.data_config['datasets'][dataset_name]
+        
+        # Get appropriate tokenizer from model manager
+        tokenizer_config = dataset_config['tokenizer']
+        tokenizer = self._get_tokenizer(tokenizer_config)
+        
+        # Process inputs according to configuration
+        processed_inputs = self._tokenize_and_process(texts, tokenizer, dataset_config)
+        
+        return processed_inputs
+    
+    def _get_tokenizer(self, config: Dict):
+        """Retrieve appropriate tokenizer from model manager."""
+        model_type = config['type']
+        model_name = config['model']
+        return self.model_manager.get_model(model_type, model_name)[1]
+    
+    def _tokenize_and_process(self, texts: List[str], tokenizer, config: Dict):
+        """Implement tokenization and processing logic."""
+        # Implementation of tokenization and processing
+        return {}  # Placeholder for actual implementation
+
     def prepare_inputs(
         self,
         texts: Union[str, List[str]],

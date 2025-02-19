@@ -1,100 +1,74 @@
-from typing import Dict, List, Optional, Union, Any
-import tensorflow as tf
-from .core import DatasetSetup
-from .preprocessing.inputs import InputProcessor
-from .preprocessing.targets import TargetGenerator, TargetProcessor
+from typing import Dict, Optional, List
+from datasets import DatasetDict
+import logging
+
+from src.data.core import (
+    ConfigurationManager,
+    DependencyManager,
+    ModelManager,
+    DatasetSetup
+)
+from src.data.preprocessing.Inputs import InputProcessor
+from src.data.preprocessing.Targets import TargetHandler
+
+logger = logging.getLogger(__name__)
 
 class DataPipeline:
-    def __init__(
-        self,
-        config_manager,
-        dataset_name: str,
-        split: str = "train"
-    ):
-        self.config_manager = config_manager
-        self.dataset_name = dataset_name
-        self.split = split
-        
-        # Initialize components
-        self.dataset_setup = DatasetSetup(config_manager, dataset_name, split)
-        self.input_processor = InputProcessor(config_manager, dataset_name)
-        self.target_generator = TargetGenerator(config_manager, dataset_name)
-        self.target_processor = TargetProcessor(config_manager, dataset_name)
+    """Coordinates data processing components and manages the overall pipeline."""
     
-    def prepare_dataset(
-        self,
-        batch_size: int,
-        tasks: Optional[List[str]] = None,
-        shuffle: bool = True,
-        cache: bool = True
-    ) -> tf.data.Dataset:
-        """Prepare dataset with specified tasks."""
-        # Get base dataset
-        dataset = self.dataset_setup.prepare_dataset(
-            batch_size=batch_size,
-            shuffle=shuffle,
-            cache=cache
-        )
+    def __init__(self, config_dir: str):
+        # Initialize core components
+        self.config_manager = ConfigurationManager(config_dir)
+        self.dependency_manager = DependencyManager(self.config_manager)
+        self.model_manager = ModelManager(self.config_manager)
         
-        # If no tasks specified, use all tasks from config
-        if tasks is None:
-            tasks = self.dataset_setup.dataset_config["tasks"].keys()
+        # Initialize dataset setup
+        self.dataset_setup = DatasetSetup(self.config_manager)
         
-        # Process each task
-        def process_batch(batch):
-            features = {}
-            texts = batch["texts"]
-            
-            # Process inputs for each task
-            for task in tasks:
-                task_inputs = self.input_processor.prepare_inputs(texts, task)
-                features.update({
-                    f"{task}_{k}": v for k, v in task_inputs.items()
-                })
-                
-                # Generate and process targets if needed
-                if "labels" not in batch:
-                    targets = self.target_generator.generate_targets(texts, task)
-                    processed_targets = self.target_processor.process_targets(targets, task)
-                    features.update({
-                        f"{task}_{k}": v for k, v in processed_targets.items()
-                    })
-            
-            return features
-        
-        # Apply processing to dataset
-        return dataset.map(
-            process_batch,
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
+        # Initialize preprocessing components
+        self.input_processor = InputProcessor(self.config_manager, self.model_manager)
+        self.target_handler = TargetHandler(self.config_manager, self.model_manager)
     
-    def process_batch(
-        self,
-        texts: Union[str, List[str]],
-        tasks: Optional[List[str]] = None
-    ) -> Dict[str, tf.Tensor]:
+    def prepare_dataset(self, dataset_name: str) -> DatasetDict:
+        """Prepare a dataset with all necessary processing steps."""
+        # Initialize dependencies if needed
+        self.dependency_manager.install_dependencies()
+        
+        # Load and setup dataset
+        dataset = self.dataset_setup.initialize_dataset(dataset_name)
+        
+        # Process dataset
+        processed_dataset = self._process_dataset(dataset, dataset_name)
+        
+        return processed_dataset
+    
+    def _process_dataset(self, dataset: DatasetDict, dataset_name: str) -> DatasetDict:
+        """Apply all processing steps to the dataset."""
+        for split_name, split_data in dataset.items():
+            # Process inputs
+            inputs = self.input_processor.process_inputs(
+                split_data['text'],
+                dataset_name
+            )
+            
+            # Generate targets
+            targets = self.target_handler.generate_targets(
+                split_data['text'],
+                dataset_name
+            )
+            
+            # Update dataset with processed data
+            processed_features = {**inputs, **targets}
+            dataset[split_name] = split_data.add_columns(processed_features)
+        
+        return dataset
+    
+    def process_batch(self, texts: List[str], dataset_name: str) -> Dict:
         """Process a single batch of texts."""
-        if isinstance(texts, str):
-            texts = [texts]
+        inputs = self.input_processor.process_inputs(texts, dataset_name)
+        targets = self.target_handler.generate_targets(texts, dataset_name)
         
-        # If no tasks specified, use all tasks from config
-        if tasks is None:
-            tasks = self.dataset_setup.dataset_config["tasks"].keys()
-        
-        features = {}
-        
-        # Process inputs for each task
-        for task in tasks:
-            task_inputs = self.input_processor.prepare_inputs(texts, task)
-            features.update({
-                f"{task}_{k}": v for k, v in task_inputs.items()
-            })
-            
-            # Generate and process targets
-            targets = self.target_generator.generate_targets(texts, task)
-            processed_targets = self.target_processor.process_targets(targets, task)
-            features.update({
-                f"{task}_{k}": v for k, v in processed_targets.items()
-            })
-        
-        return features
+        return {
+            'inputs': inputs,
+            'targets': targets
+        }
