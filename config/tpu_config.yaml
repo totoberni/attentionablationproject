@@ -1,18 +1,10 @@
-tpu:
-  zone: "us-central1-a"
-  type: "v3-8"
-  name: "thesis-tpu"
-  pytorch_xla: true
-  
-storage:
-  bucket: "gs://thesis-project"
-  checkpoint_dir: "checkpoints"
-  
 distribution:
   strategy: "tpu"
-  num_replicas: 8
-  
+  num_replicas: 8  # Adjust based on your TPU_TYPE (e.g., v5e-4 has 4 cores)
+  batch_size_per_replica: 32 # Tune this. Start with 32 or 64, multiples of 8
+
 logging:
   tensorboard: true
-  wandb: true
-  log_frequency: 100 
+  wandb: true  # Set to false if you don't use Weights & Biases
+  log_frequency: 100 # Log every 100 steps
+  profile_batch: "2,5" # Profile batches 2-5

@@ -1,41 +1,67 @@
 project_root/
+├── .env                      # Environment variables
+├── .gitignore               # Git ignore file
+├── README.md                # Project documentation
 ├── config/
-│ ├── model_config.yaml # Model architecture parameters
-│ ├── data_config.yaml # Dataset and preprocessing settings
-│ └── tpu_config.yaml # TPU-specific configurations
+│   ├── model_config.yaml    # Model architecture parameters
+│   ├── data_config.yaml     # Dataset and preprocessing settings
+│   └── tpu_config.yaml      # TPU-specific configurations
 ├── docker/
-│ ├── Dockerfile # TPU-compatible environment
-│ ├── requirements.txt # Python dependencies
-│ └── scripts/
-│ └── setup_tpu.sh # TPU initialization
+│   ├── Dockerfile           # TPU-compatible environment
+│   ├── requirements.txt     # Python dependencies
+│   ├── verify_tf.py        # TensorFlow/TPU verification script
+│   └── scripts/
+│       ├── setup_tpu.sh     # TPU initialization
+│       ├── run_data_setup.sh # Dataset setup script
+│       └── run_preprocess.sh # Preprocessing script
 └── src/
-├── data/
-│ ├── core/
-│ │ ├── __init__.py
-│ │ ├── base.py
-│ │ ├── dependencies.py
-│ │ ├── models.py
-│ │ ├── setup.py
-│ │ └── types.py
-│ ├── preprocessing/
-│ │ ├── Inputs.py
-│ │ └── Targets.py
-│ └── DataPipeline.py
-├── models/
-│ ├── transformer/
-│ │ ├── ablated.py
-│ │ └── attention.py
-│ └── static/
-│ ├── ffn.py
-│ └── embeddings.py
-├── training/
-│ ├── trainer.py
-│ ├── losses.py
-│ └── metrics.py
-└── utils/
-├── logging.py
-└── visualization.py
+    ├── data/
+    │   ├── core/
+    │   │   ├── __init__.py  # Core module exports
+    │   │   ├── base.py      # Base classes (BaseManager, ConfigurationManager)
+    │   │   ├── dependencies.py # Dependency management
+    │   │   ├── models.py    # Model and tokenizer management
+    │   │   ├── setup.py     # Dataset setup utilities
+    │   │   ├── types.py     # Type definitions and data classes
+    │   │   └── utils.py     # Common utilities
+    │   ├── preprocessing/
+    │   │   ├── __init__.py
+    │   │   ├── Inputs.py    # Input processing
+    │   │   └── Targets.py   # Target generation
+    │   └── DataPipeline.py  # Main data pipeline
+    ├── models/
+    │   ├── transformer/
+    │   │   ├── __init__.py
+    │   │   ├── ablated.py   # Ablated transformer implementation
+    │   │   └── attention.py # Attention mechanisms
+    │   └── static/
+    │       ├── __init__.py
+    │       ├── ffn.py       # Feed-forward networks
+    │       └── embeddings.py # Embedding layers
+    ├── training/
+    │   ├── __init__.py
+    │   ├── trainer.py       # Training loop implementation
+    │   ├── losses.py        # Loss functions
+    │   └── metrics.py       # Evaluation metrics
+    ├── utils/
+    │   ├── __init__.py
+    │   ├── logging.py       # Logging utilities
+    │   └── visualization.py # Visualization tools
+    └── testing/
+        └── test_data/
+            └── test_DataPipeline.py # Pipeline tests
+
+# Generated directories during runtime
+├── cache/              # Model and tokenizer cache
+├── checkpoints/        # Model checkpoints
+├── data/              # Dataset storage
+│   ├── raw/           # Raw dataset files
+│   └── processed/     # Processed TFRecords
+├── logs/              # Training and execution logs
+│   ├── tensorboard/   # TensorBoard logs
+│   └── wandb/         # Weights & Biases logs
+└── .tpu/              # TPU-specific files
 
 
 chmod +x scripts/setup_tpu.sh scripts/set_down.sh
-icacls scripts/run_preprocess.sh /grant Users:RX
+icacls scripts/run_data_setup.sh /grant Users:RX
