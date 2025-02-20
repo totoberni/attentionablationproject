@@ -14,13 +14,18 @@ import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+from datetime import datetime
 
 from src.data.core import (
     ConfigurationManager,
     ModelManager,
     TaskType,
     ModelTarget,
-    TaskLabels
+    TaskLabels,
+    verify_alignment,
+    reconstruct_text,
+    hash_text,
+    get_special_token_info
 )
 
 logger = logging.getLogger(__name__)
@@ -416,10 +421,14 @@ class TargetProcessor:
 class TargetHandler:
     """Handles generation and processing of target labels."""
     
-    def __init__(self, config_manager: ConfigurationManager, model_manager: ModelManager):
+    def __init__(
+        self,
+        config_manager: ConfigurationManager,
+        model_manager: ModelManager
+    ):
         self.config_manager = config_manager
         self.model_manager = model_manager
-        self.data_config = config_manager.get_config('data')
+        self.data_config = config_manager.get_config('data_config')
     
     def generate_targets(
         self,
@@ -428,44 +437,72 @@ class TargetHandler:
         tasks: Optional[List[TaskType]] = None,
         model_type: str = "transformer"
     ) -> ModelTarget:
-        """Generate targets based on dataset configuration."""
-        # Create a copy of texts for processing to avoid modifying originals
-        processed_texts = texts.copy()
+        """Generate targets for specified tasks."""
         dataset_config = self.data_config['datasets'][dataset_name]
+        max_length = dataset_config.get('max_length', 512)
         
-        # Initialize ModelTarget
-        model_target = ModelTarget(
-            reconstruction_targets=np.zeros((len(processed_texts), dataset_config['max_length'])),
-            sequence_mask=np.ones((len(processed_texts), dataset_config['max_length']))
+        # Initialize ModelTarget with reconstruction targets
+        tokenizer = self._get_tokenizer(model_type, dataset_config)
+        encodings = tokenizer(
+            texts,
+            max_length=max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='tf'
         )
         
-        # If no tasks specified, use enabled tasks from config
+        model_target = ModelTarget(
+            reconstruction_targets=encodings['input_ids'].numpy(),
+            sequence_mask=encodings['attention_mask'].numpy(),
+            metadata={
+                'tokenizer_info': {
+                    'type': model_type,
+                    'name': dataset_config['tokenizer']['model'],
+                    'special_tokens': get_special_token_info(tokenizer)
+                },
+                'text_hashes': [hash_text(text) for text in texts],
+                'sequence_lengths': [len(text.split()) for text in texts],
+                'processing_time': datetime.now().isoformat()
+            }
+        )
+        
+        # Get enabled tasks if none specified
         if tasks is None:
             tasks = [TaskType[task.upper()] for task in dataset_config['enabled_tasks']]
         
         # Generate targets for each task
         for task in tasks:
-            task_config = dataset_config['task_overrides'].get(
-                task.name.lower(),
-                self.data_config['tasks'][task.name.lower()]
-            )
-            
-            if task_config.get('enabled', True):
+            task_config = self._get_task_config(task, dataset_config)
+            if task_config:
                 labels, mask, metadata = self._generate_task_targets(
-                    processed_texts.copy(),  # Pass a new copy for each task
+                    texts,
                     task,
                     task_config,
                     model_type
                 )
-                
-                model_target.add_task_labels(
-                    task_type=task,
-                    labels=labels,
-                    mask=mask,
-                    metadata=metadata
-                )
+                model_target.add_task_labels(task.name.lower(), labels, mask, metadata)
         
         return model_target
+    
+    def _get_tokenizer(self, model_type: str, dataset_config: Dict):
+        """Get appropriate tokenizer based on model type and config."""
+        tokenizer_config = dataset_config.get('tokenizer', {})
+        return self.model_manager.get_tokenizer(
+            tokenizer_type=tokenizer_config.get('type', 'wordpiece'),
+            model_name=tokenizer_config.get('model', 'bert-base-uncased')
+        )
+    
+    def _get_task_config(self, task: TaskType, dataset_config: Dict) -> Optional[Dict]:
+        """Get task-specific configuration."""
+        task_name = task.name.lower()
+        if task_name not in dataset_config.get('enabled_tasks', []):
+            return None
+        
+        task_config = self.data_config['tasks'].get(task_name, {})
+        task_overrides = dataset_config.get('task_overrides', {}).get(task_name, {})
+        
+        # Merge base config with overrides
+        return {**task_config, **task_overrides}
     
     def _generate_task_targets(
         self,
@@ -484,7 +521,12 @@ class TargetHandler:
         elif task == TaskType.CONTRASTIVE:
             return self._generate_contrastive_targets(texts, config)
         elif task in [TaskType.MLM, TaskType.LMLM]:
-            return self._generate_mlm_lmlm_targets(texts, task == TaskType.LMLM, config, model_type)
+            return self._generate_mlm_lmlm_targets(
+                texts,
+                is_lmlm=(task == TaskType.LMLM),
+                task_config=config,
+                model_type=model_type
+            )
         elif task == TaskType.NSP:
             return self._generate_nsp_targets(texts, config)
         else:
@@ -495,9 +537,23 @@ class TargetHandler:
         texts: List[str],
         config: Dict
     ) -> Tuple[np.ndarray, None, Optional[Dict[str, Any]]]:
-        model = self.model_manager.get_model(config['type'], config['model'])
-        results = model(texts)
-        return np.array([r['label'] for r in results]), None, None
+        """Generate sentiment analysis targets."""
+        model = self.model_manager.get_model(
+            model_type="transformer",
+            model_name=config['model'],
+            task="sentiment"
+        )
+        
+        outputs = model(texts)
+        labels = np.array([output['label'] for output in outputs])
+        
+        metadata = {
+            'model_name': config['model'],
+            'label_mapping': config.get('label_mapping', {}),
+            'preserve_original_labels': config.get('preserve_original_labels', True)
+        }
+        
+        return labels, None, metadata
     
     def _generate_token_targets(
         self,
@@ -505,66 +561,120 @@ class TargetHandler:
         task: TaskType,
         config: Dict
     ) -> Tuple[np.ndarray, np.ndarray, Optional[Dict[str, Any]]]:
-        model = self.model_manager.get_model(config['type'], config['model'])
+        """Generate token-level targets (NER, POS)."""
+        model_type = config.get('type', 'spacy')
+        model = self.model_manager.get_model(
+            model_type=model_type,
+            model_name=config['model'],
+            task=task.name.lower()
+        )
         
-        # Process texts and get token-level predictions
-        targets = []
-        masks = []
-        
-        for doc in model.pipe(texts):
-            if task == TaskType.NER:
-                tokens = [ent.label_ for ent in doc.ents]
-                mask = np.zeros(len(doc))
-                for ent in doc.ents:
-                    mask[ent.start:ent.end] = 1
-            else:  # POS
-                tokens = [token.pos_ for token in doc]
-                mask = np.ones(len(doc))
+        if model_type == "spacy":
+            docs = list(model.pipe(texts))
+            labels = []
+            masks = []
             
-            targets.append(tokens)
-            masks.append(mask)
+            for doc in docs:
+                if task == TaskType.POS:
+                    doc_labels = [token.pos_ for token in doc]
+                    doc_mask = np.ones(len(doc))
+                else:  # NER
+                    doc_labels = ["O"] * len(doc)
+                    doc_mask = np.zeros(len(doc))
+                    for ent in doc.ents:
+                        doc_labels[ent.start:ent.end] = [f"B-{ent.label_}"] + [f"I-{ent.label_}"] * (ent.end - ent.start - 1)
+                        doc_mask[ent.start:ent.end] = 1
+                
+                labels.append(doc_labels)
+                masks.append(doc_mask)
+            
+            metadata = {
+                'model_name': config['model'],
+                'align_with_tokens': config.get('align_with_tokens', True),
+                'label_scheme': 'BIO' if task == TaskType.NER else 'POS'
+            }
+            
+            return np.array(labels), np.array(masks), metadata
         
-        return np.array(targets), np.array(masks), None
+        else:
+            raise ValueError(f"Unsupported model type for {task.name}: {model_type}")
     
     def _generate_discourse_targets(
         self,
         texts: List[str],
         config: Dict
     ) -> Tuple[np.ndarray, None, Dict[str, Any]]:
-        markers = config['markers']
-        targets = np.zeros((len(texts), len(markers)))
+        """Generate discourse marker targets."""
+        markers = config.get('markers', [])
+        labels = np.zeros((len(texts), len(markers)))
         
         for i, text in enumerate(texts):
             for j, marker in enumerate(markers):
-                if marker in text:
-                    targets[i, j] = 1
+                if marker.lower() in text.lower():
+                    labels[i, j] = 1
         
-        return targets, None, {'markers': markers}
+        metadata = {
+            'markers': markers,
+            'multi_label': True,
+            'label_distribution': {
+                marker: int(labels[:, i].sum())
+                for i, marker in enumerate(markers)
+            }
+        }
+        
+        return labels, None, metadata
     
     def _generate_contrastive_targets(
         self,
         texts: List[str],
         config: Dict
     ) -> Tuple[np.ndarray, None, Dict[str, Any]]:
-        # Get embeddings
-        nlp = spacy.load('en_core_web_lg')
-        embeddings = np.array([doc.vector for doc in nlp.pipe(texts)])
-        
-        # Find optimal clusters
-        n_clusters = self._find_optimal_clusters(
-            embeddings,
-            config['min_clusters'],
-            config['max_clusters']
+        """Generate contrastive learning targets."""
+        # Get embeddings for clustering
+        model = self.model_manager.get_model(
+            model_type="transformer",
+            model_name=config['model']
         )
         
-        # Cluster
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        labels = kmeans.fit_predict(embeddings)
+        embeddings = model.encode(texts)
         
-        return labels, None, {
-            'embeddings': embeddings,
-            'cluster_centers': kmeans.cluster_centers_
+        # Find optimal number of clusters
+        min_clusters = config.get('min_clusters', 3)
+        max_clusters = config.get('max_clusters', 8)
+        n_clusters = self._find_optimal_clusters(
+            embeddings,
+            min_clusters,
+            max_clusters
+        )
+        
+        # Perform clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        cluster_labels = kmeans.fit_predict(embeddings)
+        
+        metadata = {
+            'n_clusters': n_clusters,
+            'cluster_sizes': np.bincount(cluster_labels).tolist(),
+            'silhouette_score': float(silhouette_score(embeddings, cluster_labels)),
+            'clustering_method': config.get('clustering_method', 'kmeans')
         }
+        
+        return cluster_labels, None, metadata
+    
+    def _find_optimal_clusters(
+        self,
+        embeddings: np.ndarray,
+        min_clusters: int,
+        max_clusters: int
+    ) -> int:
+        """Find optimal number of clusters using silhouette score."""
+        scores = []
+        for n in range(min_clusters, max_clusters + 1):
+            kmeans = KMeans(n_clusters=n, random_state=42)
+            labels = kmeans.fit_predict(embeddings)
+            score = silhouette_score(embeddings, labels)
+            scores.append((score, n))
+        
+        return max(scores, key=lambda x: x[0])[1]
     
     def _generate_mlm_lmlm_targets(
         self,
@@ -573,99 +683,116 @@ class TargetHandler:
         task_config: Dict = None,
         model_type: str = "transformer"
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-        """Generate masked language modeling targets using tokenization."""
-        # Get tokenizer based on model type
-        tokenizer_config = self.data_config['tokenizers'][model_type]
-        tokenizer = self.model_manager.get_tokenizer(
-            tokenizer_config['type'],
-            tokenizer_config['model']
-        )
+        """Generate masked language modeling targets."""
+        tokenizer = self._get_tokenizer(model_type, task_config)
         max_length = task_config.get('max_length', 512)
         
-        # Create a tokenized copy for mask generation
-        encoded = tokenizer(
+        # Tokenize texts
+        encodings = tokenizer(
             texts,
+            max_length=max_length,
             padding='max_length',
             truncation=True,
-            max_length=max_length,
-            return_tensors='np',
-            return_word_ids=True  # Added to get word_ids for alignment
+            return_tensors='tf'
         )
         
-        input_shape = encoded['input_ids'].shape
-        attention_mask = encoded['attention_mask']
+        input_ids = encodings['input_ids'].numpy()
+        attention_mask = encodings['attention_mask'].numpy()
         
-        # Generate masks based on task type
-        masks = self._generate_task_specific_masks(
-            encoded,
-            is_lmlm,
-            task_config,
-            model_type,
-            attention_mask
-        )
+        # Generate masks
+        if is_lmlm:
+            masked_positions = self._generate_lmlm_masks(
+                input_ids,
+                attention_mask,
+                task_config
+            )
+        else:
+            masked_positions = self._generate_mlm_masks(
+                input_ids,
+                attention_mask,
+                task_config
+            )
         
-        # Enhanced metadata for alignment
         metadata = {
-            'tokenization_info': {
-                'model_type': model_type,
-                'tokenizer_name': tokenizer_config['model'],
-                'tokenizer_type': tokenizer_config['type'],
-                'sequence_lengths': [len(t) for t in texts],
-                'token_maps': encoded.word_ids() if hasattr(encoded, 'word_ids') else None,
-                'original_text_hashes': [self._hash_text(t) for t in texts],
-                'max_length': max_length,
-                'attention_mask': attention_mask,
-                'whole_word_mask': task_config.get('whole_word_mask', False) and model_type == "transformer",
-                'special_tokens': {
-                    'cls': tokenizer.cls_token_id,
-                    'sep': tokenizer.sep_token_id,
-                    'pad': tokenizer.pad_token_id,
-                    'mask': tokenizer.mask_token_id
-                }
-            },
-            'task_info': {
-                'type': 'lmlm' if is_lmlm else 'mlm',
-                'config': task_config
-            }
+            'task_type': 'lmlm' if is_lmlm else 'mlm',
+            'mask_probability': task_config.get('mask_probability', 0.15),
+            'whole_word_mask': task_config.get('whole_word_mask', True),
+            'masked_positions': masked_positions.tolist()
         }
         
-        return encoded['input_ids'], masks, metadata
+        return input_ids, masked_positions, metadata
+    
+    def _generate_mlm_masks(
+        self,
+        input_ids: np.ndarray,
+        attention_mask: np.ndarray,
+        config: Dict
+    ) -> np.ndarray:
+        """Generate masks for standard MLM."""
+        probability = config.get('mask_probability', 0.15)
+        special_tokens = config.get('special_tokens', [])
+        
+        masked_positions = np.zeros_like(input_ids)
+        valid_positions = (attention_mask == 1) & ~np.isin(input_ids, special_tokens)
+        
+        for i in range(len(input_ids)):
+            valid_indices = np.where(valid_positions[i])[0]
+            n_mask = int(len(valid_indices) * probability)
+            mask_indices = np.random.choice(valid_indices, n_mask, replace=False)
+            masked_positions[i, mask_indices] = 1
+        
+        return masked_positions
+    
+    def _generate_lmlm_masks(
+        self,
+        input_ids: np.ndarray,
+        attention_mask: np.ndarray,
+        config: Dict
+    ) -> np.ndarray:
+        """Generate masks for large-span MLM."""
+        min_span = config.get('min_span', 2)
+        max_span = config.get('max_span', 5)
+        special_tokens = config.get('special_tokens', [])
+        
+        masked_positions = np.zeros_like(input_ids)
+        valid_positions = (attention_mask == 1) & ~np.isin(input_ids, special_tokens)
+        
+        for i in range(len(input_ids)):
+            valid_indices = np.where(valid_positions[i])[0]
+            current_pos = 0
+            
+            while current_pos < len(valid_indices):
+                if np.random.random() < config.get('mask_probability', 0.15):
+                    span_length = np.random.randint(min_span, max_span + 1)
+                    end_pos = min(current_pos + span_length, len(valid_indices))
+                    masked_positions[i, valid_indices[current_pos:end_pos]] = 1
+                    current_pos = end_pos
+                else:
+                    current_pos += 1
+        
+        return masked_positions
     
     def _generate_nsp_targets(
         self,
         texts: List[str],
         config: Dict
     ) -> Tuple[np.ndarray, None, None]:
-        # Split into pairs
-        pairs = [(texts[i], texts[i+1]) for i in range(0, len(texts)-1, 2)]
+        """Generate next sentence prediction targets."""
+        # Split texts into pairs
+        text_pairs = []
         labels = []
         
-        for first, second in pairs:
-            if np.random.random() < config['negative_sampling_ratio']:
+        for i in range(0, len(texts) - 1, 2):
+            if np.random.random() < config.get('negative_sampling_ratio', 0.5):
                 # Create negative pair
-                random_idx = np.random.randint(len(texts))
+                random_idx = np.random.choice(
+                    [j for j in range(len(texts)) if j != i + 1]
+                )
+                text_pairs.append((texts[i], texts[random_idx]))
                 labels.append(0)
             else:
+                # Use consecutive sentences
+                text_pairs.append((texts[i], texts[i + 1]))
                 labels.append(1)
         
-        return np.array(labels), None, None
-    
-    def _find_optimal_clusters(
-        self,
-        embeddings: np.ndarray,
-        min_clusters: int,
-        max_clusters: int
-    ) -> int:
-        best_score = -1
-        best_n = min_clusters
-        
-        for n in range(min_clusters, max_clusters + 1):
-            kmeans = KMeans(n_clusters=n, random_state=42)
-            labels = kmeans.fit_predict(embeddings)
-            score = silhouette_score(embeddings, labels)
-            
-            if score > best_score:
-                best_score = score
-                best_n = n
-        
-        return best_n 
+        return np.array(labels), None, None 

@@ -1,10 +1,11 @@
-from typing import Dict, Optional, List, Union, Tuple
+from typing import Dict, Optional, List, Union, Tuple, Any
 from datasets import DatasetDict
 import logging
 import tensorflow as tf
 import numpy as np
 from datetime import datetime
 import os
+from tqdm import tqdm
 
 from src.data.core import (
     ConfigurationManager,
@@ -13,7 +14,11 @@ from src.data.core import (
     DatasetSetup,
     TaskType,
     ModelInput,
-    ModelTarget
+    ModelTarget,
+    verify_alignment,
+    verify_task_alignment,
+    verify_token_alignment,
+    create_sharded_dataset
 )
 from src.data.preprocessing.Inputs import InputProcessor
 from src.data.preprocessing.Targets import TargetHandler
@@ -23,18 +28,35 @@ logger = logging.getLogger(__name__)
 class DataPipeline:
     """Coordinates data processing components and manages the overall pipeline."""
     
-    def __init__(self, config_dir: str):
-        # Initialize core components
-        self.config_manager = ConfigurationManager(config_dir)
-        self.dependency_manager = DependencyManager(self.config_manager)
-        self.model_manager = ModelManager(self.config_manager)
+    def __init__(
+        self,
+        config_manager: ConfigurationManager,
+        dependency_manager: Optional[DependencyManager] = None,
+        model_manager: Optional[ModelManager] = None,
+        dataset_setup: Optional[DatasetSetup] = None,
+        input_processor: Optional[InputProcessor] = None,
+        target_handler: Optional[TargetHandler] = None
+    ):
+        """Initialize the data pipeline with injected dependencies."""
+        self.config_manager = config_manager
         
-        # Initialize dataset setup
-        self.dataset_setup = DatasetSetup(self.config_manager)
+        # Initialize or use injected components
+        self.dependency_manager = dependency_manager or DependencyManager(config_manager)
+        self.model_manager = model_manager or ModelManager(config_manager)
+        self.dataset_setup = dataset_setup or DatasetSetup(config_manager)
+        self.input_processor = input_processor or InputProcessor(config_manager, self.model_manager)
+        self.target_handler = target_handler or TargetHandler(config_manager, self.model_manager)
         
-        # Initialize preprocessing components
-        self.input_processor = InputProcessor(self.config_manager, self.model_manager)
-        self.target_handler = TargetHandler(self.config_manager, self.model_manager)
+        # Load pipeline configuration
+        self.pipeline_config = self.config_manager.get_config('pipeline_config')
+        
+        # Initialize processing state
+        self.processing_state = {
+            'current_dataset': None,
+            'current_model_type': None,
+            'processed_tasks': set(),
+            'alignment_verified': False
+        }
     
     def process_data(
         self, 
@@ -42,93 +64,217 @@ class DataPipeline:
         dataset_name: str,
         tasks: Optional[List[TaskType]] = None,
         model_type: str = "transformer",
-        is_batch: bool = False
+        batch_size: int = 32,
+        num_shards: int = 1,
+        shuffle_buffer_size: int = 10000
     ) -> Union[DatasetDict, Dict[str, tf.Tensor]]:
-        """Process data (either dataset or batch) with unified processing logic."""
-        # Initialize dependencies if needed
-        if not is_batch:
-            self.dependency_manager.install_dependencies()
-        
-        if is_batch:
-            return self._process_single_batch(data_source, dataset_name, tasks, model_type)
-        else:
-            return self._process_dataset_splits(data_source, dataset_name, tasks, model_type)
+        """Process data with unified processing logic and optional sharding."""
+        try:
+            # Update processing state
+            self._update_processing_state(dataset_name, model_type)
+            
+            # Initialize dependencies if needed
+            if isinstance(data_source, DatasetDict):
+                self.dependency_manager.install_dependencies()
+            
+            # Process based on input type
+            if isinstance(data_source, list):
+                return self._process_single_batch(
+                    data_source,
+                    dataset_name,
+                    tasks,
+                    model_type,
+                    batch_size
+                )
+            else:
+                return self._process_dataset_splits(
+                    data_source,
+                    dataset_name,
+                    tasks,
+                    model_type,
+                    batch_size,
+                    num_shards,
+                    shuffle_buffer_size
+                )
+                
+        except Exception as e:
+            logger.error(f"Error during data processing: {str(e)}")
+            raise
+    
+    def _update_processing_state(self, dataset_name: str, model_type: str) -> None:
+        """Update the current processing state."""
+        if (
+            dataset_name != self.processing_state['current_dataset'] or
+            model_type != self.processing_state['current_model_type']
+        ):
+            self.processing_state.update({
+                'current_dataset': dataset_name,
+                'current_model_type': model_type,
+                'processed_tasks': set(),
+                'alignment_verified': False
+            })
     
     def _process_single_batch(
         self,
         texts: List[str],
         dataset_name: str,
         tasks: Optional[List[TaskType]],
-        model_type: str
+        model_type: str,
+        batch_size: int
     ) -> Dict[str, tf.Tensor]:
-        """Process a single batch of texts with bidirectional verification."""
+        """Process a single batch with enhanced error handling and metadata."""
         logger.info(f"Processing batch for {model_type} model...")
         
-        # Forward direction: Text → Input → Target verification
-        model_inputs = self.input_processor.process_inputs(
-            texts=texts,
-            dataset_name=dataset_name,
-            model_type=model_type
-        )
+        try:
+            # Process in smaller batches if needed
+            if len(texts) > batch_size:
+                return self._process_large_batch(
+                    texts,
+                    dataset_name,
+                    tasks,
+                    model_type,
+                    batch_size
+                )
+            
+            # Forward processing
+            model_inputs = self.input_processor.process_inputs(
+                texts=texts,
+                dataset_name=dataset_name,
+                model_type=model_type
+            )
+            
+            model_targets = self.target_handler.generate_targets(
+                texts=texts,
+                dataset_name=dataset_name,
+                tasks=tasks,
+                model_type=model_type
+            )
+            
+            # Verify alignment
+            self._verify_bidirectional_alignment(
+                model_inputs.metadata,
+                model_targets.metadata,
+                dataset_name,
+                model_type
+            )
+            
+            # Update processing state
+            self.processing_state['alignment_verified'] = True
+            self.processing_state['processed_tasks'].update(
+                model_targets.metadata.get('task_info', {}).keys()
+            )
+            
+            # Create metadata
+            metadata = self._create_batch_metadata(
+                dataset_name,
+                model_type,
+                len(texts)
+            )
+            
+            # Combine and return tensors
+            return {
+                **model_inputs.to_tensors(),
+                **model_targets.to_tensors(),
+                'metadata': metadata
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing batch: {str(e)}")
+            raise
+    
+    def _process_large_batch(
+        self,
+        texts: List[str],
+        dataset_name: str,
+        tasks: Optional[List[TaskType]],
+        model_type: str,
+        batch_size: int
+    ) -> Dict[str, tf.Tensor]:
+        """Process a large batch in smaller chunks."""
+        logger.info(f"Processing large batch of size {len(texts)} in chunks of {batch_size}")
         
-        model_targets = self.target_handler.generate_targets(
-            texts=texts,
-            dataset_name=dataset_name,
-            tasks=tasks,
-            model_type=model_type
-        )
+        # Process in chunks
+        processed_chunks = []
+        for i in tqdm(range(0, len(texts), batch_size)):
+            chunk = texts[i:i + batch_size]
+            processed_chunk = self._process_single_batch(
+                chunk,
+                dataset_name,
+                tasks,
+                model_type,
+                batch_size
+            )
+            processed_chunks.append(processed_chunk)
         
-        # Verify bidirectional alignment
-        self._verify_bidirectional_alignment(
-            model_inputs.metadata,
-            model_targets.metadata,
-            dataset_name,
-            model_type
-        )
+        # Combine chunks
+        combined = {}
+        for key in processed_chunks[0].keys():
+            if key == 'metadata':
+                combined[key] = self._merge_chunk_metadata(
+                    [chunk[key] for chunk in processed_chunks]
+                )
+            else:
+                combined[key] = np.concatenate(
+                    [chunk[key] for chunk in processed_chunks],
+                    axis=0
+                )
         
-        # Store alignment verification in metadata
-        alignment_metadata = {
-            'alignment_verified': True,
-            'timestamp': datetime.now().isoformat(),
-            'model_type': model_type,
-            'dataset': dataset_name,
-            'processed_tasks': list(self.input_processor.processed_inputs),
-            'verification_type': 'bidirectional'
-        }
-        
-        # Combine tensors
-        return {
-            **model_inputs.to_tensors(),
-            **model_targets.to_tensors(),
-            'metadata': alignment_metadata
-        }
+        return combined
     
     def _process_dataset_splits(
         self,
         dataset: DatasetDict,
         dataset_name: str,
         tasks: Optional[List[TaskType]],
-        model_type: str
+        model_type: str,
+        batch_size: int,
+        num_shards: int,
+        shuffle_buffer_size: int
     ) -> DatasetDict:
-        """Process all splits in a dataset with bidirectional verification."""
+        """Process dataset splits with sharding support."""
+        processed_dataset = {}
+        
         for split_name, split_data in dataset.items():
-            logger.info(f"Processing {split_name} split for {model_type} model...")
-            raw_texts = split_data['text']
+            logger.info(f"Processing {split_name} split...")
             
-            # Process the split as a batch
-            processed_features = self._process_single_batch(
-                raw_texts,
-                dataset_name,
-                tasks,
-                model_type
+            # Create sharded dataset
+            sharded_data = create_sharded_dataset(
+                split_data['text'],
+                num_shards,
+                shuffle_buffer_size
             )
             
-            # Update dataset with processed features
-            dataset[split_name] = split_data.add_columns(processed_features)
+            # Process each shard
+            processed_shards = []
+            for shard in sharded_data.batch(batch_size):
+                processed_shard = self._process_single_batch(
+                    shard.numpy().tolist(),
+                    dataset_name,
+                    tasks,
+                    model_type,
+                    batch_size
+                )
+                processed_shards.append(processed_shard)
             
-            logger.info(f"Successfully processed {split_name} split with bidirectional verification")
+            # Combine shards
+            processed_features = {}
+            for key in processed_shards[0].keys():
+                if key == 'metadata':
+                    processed_features[key] = self._merge_chunk_metadata(
+                        [shard[key] for shard in processed_shards]
+                    )
+                else:
+                    processed_features[key] = np.concatenate(
+                        [shard[key] for shard in processed_shards],
+                        axis=0
+                    )
+            
+            # Update dataset
+            processed_dataset[split_name] = split_data.add_columns(processed_features)
+            
+            logger.info(f"Successfully processed {split_name} split")
         
-        return dataset
+        return DatasetDict(processed_dataset)
     
     def _verify_bidirectional_alignment(
         self,
@@ -137,102 +283,108 @@ class DataPipeline:
         dataset_name: str,
         model_type: str
     ) -> None:
-        """Verify bidirectional alignment between inputs and targets."""
+        """Verify bidirectional alignment with enhanced error reporting."""
         logger.info("Performing bidirectional alignment verification...")
         
-        # Input → Target verification
-        input_to_target = self._verify_alignment_direction(
-            input_metadata,
-            target_metadata,
-            "input_to_target"
-        )
-        
-        # Target → Input verification
-        target_to_input = self._verify_alignment_direction(
-            target_metadata,
-            input_metadata,
-            "target_to_input"
-        )
-        
-        if not (input_to_target and target_to_input):
-            raise ValueError(
-                f"Bidirectional alignment verification failed\n"
-                f"Model type: {model_type}\n"
-                f"Dataset: {dataset_name}\n"
-                f"Input→Target: {input_to_target}\n"
-                f"Target→Input: {target_to_input}"
+        try:
+            # Forward verification
+            input_to_target = verify_alignment(
+                input_metadata,
+                target_metadata,
+                direction="forward"
             )
+            
+            # Backward verification
+            target_to_input = verify_alignment(
+                target_metadata,
+                input_metadata,
+                direction="backward"
+            )
+            
+            # Task-specific verification
+            tasks_aligned = self._verify_task_alignments(
+                input_metadata.get('task_inputs', {}),
+                target_metadata.get('task_info', {})
+            )
+            
+            if not (input_to_target and target_to_input and tasks_aligned):
+                raise ValueError(
+                    f"Alignment verification failed:\n"
+                    f"Dataset: {dataset_name}\n"
+                    f"Model type: {model_type}\n"
+                    f"Input→Target: {input_to_target}\n"
+                    f"Target→Input: {target_to_input}\n"
+                    f"Tasks aligned: {tasks_aligned}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Alignment verification failed: {str(e)}")
+            raise
     
-    def _verify_alignment_direction(
+    def _verify_task_alignments(
         self,
-        source_metadata: Dict,
-        target_metadata: Dict,
-        direction: str
+        input_tasks: Dict[str, Dict],
+        target_tasks: Dict[str, Dict]
     ) -> bool:
-        """Verify alignment in a single direction with task verification."""
+        """Verify alignment of all task-specific data."""
         try:
-            # Base alignment verification
-            if direction == "input_to_target":
-                aligned = self.input_processor.verify_alignment(
-                    source_metadata,
-                    target_metadata.get('tokenization_info', {})
-                )
-            else:  # target_to_input
-                aligned = self.target_handler.verify_alignment(
-                    source_metadata,
-                    target_metadata
-                )
-            
-            if not aligned:
-                logger.error(f"{direction} base alignment failed")
-                return False
-            
-            # Task-specific alignment verification
-            if 'task_inputs' in source_metadata:
-                for task, task_data in source_metadata['task_inputs'].items():
-                    if task in target_metadata.get('task_info', {}):
-                        if not self._verify_task_data(
-                            task,
-                            task_data,
-                            target_metadata['task_info'][task]
-                        ):
-                            logger.error(f"{direction} task alignment failed for {task}")
-                            return False
-            
-            logger.info(f"{direction} alignment verification successful")
+            for task in input_tasks:
+                if task in target_tasks:
+                    if not verify_task_alignment(
+                        input_tasks[task],
+                        target_tasks[task]
+                    ):
+                        logger.error(f"Task alignment failed for {task}")
+                        return False
             return True
             
         except Exception as e:
-            logger.error(f"Error during {direction} alignment verification: {str(e)}")
+            logger.error(f"Error during task alignment verification: {str(e)}")
             return False
     
-    def _verify_task_data(
+    def _create_batch_metadata(
         self,
-        task: str,
-        source_data: Dict,
-        target_data: Dict
-    ) -> bool:
-        """Verify alignment of task-specific data."""
-        try:
-            if task in ["mlm", "lmlm"]:
-                return np.array_equal(
-                    source_data.get('masked_positions'),
-                    target_data.get('masked_positions')
-                )
-            
-            elif task == "nsp":
-                return np.array_equal(
-                    source_data.get('nsp_labels'),
-                    target_data.get('nsp_labels')
-                )
-            
-            # Add more task-specific verifications as needed
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error during task data verification for {task}: {str(e)}")
-            return False
+        dataset_name: str,
+        model_type: str,
+        batch_size: int
+    ) -> Dict[str, Any]:
+        """Create comprehensive metadata for processed batch."""
+        return {
+            'processing_info': {
+                'timestamp': datetime.now().isoformat(),
+                'dataset_name': dataset_name,
+                'model_type': model_type,
+                'batch_size': batch_size,
+                'processed_tasks': list(self.processing_state['processed_tasks']),
+                'alignment_verified': self.processing_state['alignment_verified']
+            },
+            'pipeline_version': self.pipeline_config.get('version', '1.0.0'),
+            'component_versions': {
+                'input_processor': self.input_processor.__class__.__version__,
+                'target_handler': self.target_handler.__class__.__version__,
+                'model_manager': self.model_manager.__class__.__version__
+            }
+        }
     
+    def _merge_chunk_metadata(self, chunk_metadata: List[Dict]) -> Dict[str, Any]:
+        """Merge metadata from multiple chunks."""
+        base_metadata = chunk_metadata[0].copy()
+        
+        # Update processing info
+        base_metadata['processing_info'].update({
+            'num_chunks': len(chunk_metadata),
+            'total_samples': sum(
+                m['processing_info']['batch_size']
+                for m in chunk_metadata
+            ),
+            'chunk_timestamps': [
+                m['processing_info']['timestamp']
+                for m in chunk_metadata
+            ]
+        })
+        
+        return base_metadata
+
     def reconstruct_data(
         self,
         processed_data: Union[Dict[str, tf.Tensor], DatasetDict],

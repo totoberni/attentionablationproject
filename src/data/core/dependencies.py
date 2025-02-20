@@ -4,11 +4,26 @@ from typing import Dict, List, Optional, Set
 import logging
 import os
 from pathlib import Path
+from packaging import version
+from .base import BaseManager, ConfigurationManager
 
-class DependencyManager:
-    def __init__(self, requirements_file: str = "docker/requirements.txt"):
+class DependencyManager(BaseManager):
+    """Manages Python package dependencies and their installation."""
+    
+    def __init__(
+        self,
+        config_manager: ConfigurationManager,
+        requirements_file: Optional[str] = None
+    ):
+        super().__init__("DependencyManager")
+        self.config_manager = config_manager
+        
+        # Get requirements file from config or use default
+        if requirements_file is None:
+            config = self.config_manager.get_config("model_config")
+            requirements_file = config.get("requirements_file", "docker/requirements.txt")
+        
         self.requirements_file = Path(requirements_file)
-        self.logger = logging.getLogger(__name__)
         self._installed_packages = self._get_installed_packages()
     
     def _get_installed_packages(self) -> Dict[str, str]:
@@ -35,6 +50,7 @@ class DependencyManager:
                         )
                     else:
                         status[pkg_name] = False
+                        self.logger.warning(f"Package not installed: {pkg_name}")
         
         return status
     
@@ -46,7 +62,10 @@ class DependencyManager:
                 to_install = [pkg for pkg, installed in status.items() if not installed]
             else:
                 with open(self.requirements_file, 'r') as f:
-                    to_install = [line.strip() for line in f if line.strip()]
+                    to_install = [
+                        line.strip() for line in f 
+                        if line.strip() and not line.startswith('#')
+                    ]
             
             if to_install:
                 self.logger.info(f"Installing packages: {', '.join(to_install)}")
@@ -54,49 +73,85 @@ class DependencyManager:
                     "pip", "install", "--no-cache-dir", *to_install
                 ])
                 self._installed_packages = self._get_installed_packages()
+                self.logger.info("Package installation completed successfully")
+            else:
+                self.logger.info("All required packages are already installed")
             
             return True
+            
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Failed to install dependencies: {str(e)}")
             return False
     
     def _parse_requirement(self, req_line: str) -> tuple[str, str]:
         """Parse package name and version from requirement line."""
-        if '>=' in req_line:
-            pkg_name, version = req_line.split('>=')
-        elif '==' in req_line:
-            pkg_name, version = req_line.split('==')
-        else:
-            pkg_name = req_line
-            version = ''
+        import re
         
-        return pkg_name.strip(), version.strip()
+        # Handle comments and whitespace
+        req_line = req_line.split('#')[0].strip()
+        if not req_line:
+            return '', ''
+        
+        # Match version specifiers
+        version_pattern = r'(>=|==|<=|!=|~=|>|<)'
+        parts = re.split(version_pattern, req_line, maxsplit=1)
+        
+        pkg_name = parts[0].strip()
+        if len(parts) > 1:
+            version_spec = parts[1] + parts[2].strip()
+        else:
+            version_spec = ''
+        
+        return pkg_name, version_spec
     
     def _check_version(self, installed: str, required: str) -> bool:
-        """Check if installed version meets requirement."""
+        """Check if installed version meets requirement using packaging.version."""
         if not required:
             return True
         
         try:
-            installed_parts = [int(x) for x in installed.split('.')]
-            required_parts = [int(x) for x in required.split('.')]
+            installed_ver = version.parse(installed)
             
-            for i, r in zip(installed_parts, required_parts):
-                if i < r:
-                    return False
-                elif i > r:
-                    return True
-            return len(installed_parts) >= len(required_parts)
-        except ValueError:
+            # Handle different version specifiers
+            import re
+            match = re.match(r'([<>=!~]+)(.*)', required)
+            if not match:
+                return True
+            
+            operator, required_ver = match.groups()
+            required_ver = version.parse(required_ver)
+            
+            if operator == '>=':
+                return installed_ver >= required_ver
+            elif operator == '==':
+                return installed_ver == required_ver
+            elif operator == '<=':
+                return installed_ver <= required_ver
+            elif operator == '!=':
+                return installed_ver != required_ver
+            elif operator == '~=':
+                # Compatible release operator
+                return installed_ver >= required_ver and installed_ver.release[0] == required_ver.release[0]
+            elif operator == '>':
+                return installed_ver > required_ver
+            elif operator == '<':
+                return installed_ver < required_ver
+            
+            return False
+            
+        except Exception as e:
             self.logger.warning(
-                f"Could not compare versions: {installed} vs {required}"
+                f"Could not compare versions: {installed} vs {required} - {str(e)}"
             )
             return True
     
     def get_missing_dependencies(self) -> Set[str]:
         """Get set of missing dependencies."""
         status = self.check_dependencies()
-        return {pkg for pkg, installed in status.items() if not installed}
+        missing = {pkg for pkg, installed in status.items() if not installed}
+        if missing:
+            self.logger.warning(f"Missing dependencies: {', '.join(missing)}")
+        return missing
     
     def export_dependencies(self, output_file: Optional[str] = None) -> None:
         """Export currently installed dependencies to requirements file."""
@@ -104,5 +159,7 @@ class DependencyManager:
             output_file = self.requirements_file
         
         with open(output_file, 'w') as f:
-            for pkg, version in sorted(self._installed_packages.items()):
-                f.write(f"{pkg}>={version}\n") 
+            for pkg, ver in sorted(self._installed_packages.items()):
+                f.write(f"{pkg}>={ver}\n")
+        
+        self.logger.info(f"Exported dependencies to: {output_file}") 
